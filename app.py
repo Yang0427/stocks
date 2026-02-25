@@ -204,7 +204,8 @@ def main():
                                 st.caption("(US/HK Stocks do not use 100-unit lots)")
                         
                         st.divider()
-                        time.sleep(0.2)
+
+                time.sleep(1.0)
             st.success("✅ Analysis Complete.")
 
 if __name__ == "__main__":
