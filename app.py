@@ -27,8 +27,18 @@ def get_stock_info(ticker):
     try:
         t = yf.Ticker(ticker)
         info = t.info
-        name = info.get('shortName') or info.get('longName') or ticker
         
+        # --- GET BOTH NAMES ---
+        long_name = info.get('longName')
+        short_name = info.get('shortName')
+        
+        # Combine them if both exist and are different, otherwise fallback gracefully
+        if long_name and short_name and long_name != short_name:
+            name = f"{long_name} - {short_name}"
+        else:
+            name = long_name or short_name or ticker
+            
+        # --- SMART CURRENCY DETECTOR ---
         if ticker.endswith('.KL'):
             currency = "RM"
         elif ticker.endswith('.HK'):
@@ -36,6 +46,7 @@ def get_stock_info(ticker):
         else:
             currency = "USD"
 
+        # --- YIELD FIX: CALCULATE MANUALLY ---
         div_rate = info.get('dividendRate', 0)
         current_price = info.get('currentPrice', 0) or info.get('previousClose', 0)
         

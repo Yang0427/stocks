@@ -29,8 +29,17 @@ def get_stock_info(ticker):
     try:
         t = yf.Ticker(ticker)
         info = t.info
-        name = info.get('shortName') or info.get('longName') or ticker
         
+        # --- GET BOTH NAMES ---
+        long_name = info.get('longName')
+        short_name = info.get('shortName')
+        
+        # Combine them if both exist and are different, otherwise fallback gracefully
+        if long_name and short_name and long_name != short_name:
+            name = f"{long_name} - {short_name}"
+        else:
+            name = long_name or short_name or ticker
+            
         # --- SMART CURRENCY DETECTOR ---
         if ticker.endswith('.KL'):
             currency = "RM"
@@ -40,18 +49,12 @@ def get_stock_info(ticker):
             currency = "USD"
 
         # --- YIELD FIX: CALCULATE MANUALLY ---
-        # Instead of trusting 'dividendYield' (which glitches),
-        # We calculate: (Dividend Rate / Current Price) * 100
-        
         div_rate = info.get('dividendRate', 0)
         current_price = info.get('currentPrice', 0) or info.get('previousClose', 0)
         
-        # If we have valid numbers, calculate it ourselves
         if div_rate and current_price and current_price > 0:
             yield_pct = (div_rate / current_price) * 100
-            
         else:
-            # Fallback to the old logic if rate/price is missing
             raw_yield = info.get('dividendYield', 0)
             if raw_yield is None:
                 yield_pct = 0.0
