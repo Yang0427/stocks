@@ -25,6 +25,7 @@ def fetch_data(ticker, period='2y'):
 def get_stock_info(ticker):
     """Fetches Name, Yield, and Currency"""
     try:
+        # We let yfinance handle the bot-bypass internally!
         t = yf.Ticker(ticker)
         info = t.info
         
@@ -62,7 +63,8 @@ def get_stock_info(ticker):
                 yield_pct = raw_yield
             
         return name, yield_pct, currency
-    except:
+    except Exception as e:
+        st.error(f"Error fetching info for {ticker}: {e}")
         return ticker, 0.0, "N/A"
 
 # --- FEE CALCULATOR (MALAYSIA ONLY) ---
