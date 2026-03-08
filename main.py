@@ -25,22 +25,16 @@ def fetch_data(ticker, period='2y'):
         return pd.DataFrame()
 
 def get_stock_info(ticker):
-    """Fetches Name, Yield, and Currency"""
+    """Fetches Name, Yield, Currency, and FUNDAMENTALS"""
     try:
         t = yf.Ticker(ticker)
         info = t.info
         
-        # --- GET BOTH NAMES ---
+        # --- GET NAMES & CURRENCY ---
         long_name = info.get('longName')
         short_name = info.get('shortName')
+        name = f"{long_name} - {short_name}" if (long_name and short_name and long_name != short_name) else (long_name or short_name or ticker)
         
-        # Combine them if both exist and are different, otherwise fallback gracefully
-        if long_name and short_name and long_name != short_name:
-            name = f"{long_name} - {short_name}"
-        else:
-            name = long_name or short_name or ticker
-            
-        # --- SMART CURRENCY DETECTOR ---
         if ticker.endswith('.KL'):
             currency = "RM"
         elif ticker.endswith('.HK'):
@@ -48,10 +42,9 @@ def get_stock_info(ticker):
         else:
             currency = "USD"
 
-        # --- YIELD FIX: CALCULATE MANUALLY ---
+        # --- YIELD CALCULATION ---
         div_rate = info.get('dividendRate', 0)
         current_price = info.get('currentPrice', 0) or info.get('previousClose', 0)
-        
         if div_rate and current_price and current_price > 0:
             yield_pct = (div_rate / current_price) * 100
         else:
@@ -62,10 +55,29 @@ def get_stock_info(ticker):
                 yield_pct = raw_yield * 100
             else:
                 yield_pct = raw_yield
+
+        # --- NEW: FUNDAMENTAL METRICS ---
+        pe_ratio = info.get('trailingPE', 0) or info.get('forwardPE', 0) or 0.0 # Valuation
+        roe = info.get('returnOnEquity', 0) # Profitability
+        if roe: roe = roe * 100 # Convert to percentage
+        else: roe = 0.0
+        
+        revenue = info.get('totalRevenue', 0) or 0
+        profit_margin = info.get('profitMargins', 0)
+        if profit_margin: profit_margin = profit_margin * 100
+        else: profit_margin = 0.0
+
+        # Format Revenue to be readable (e.g., 1.5B, 500M)
+        def format_currency(value):
+            if value >= 1e9: return f"{value/1e9:.2f}B"
+            if value >= 1e6: return f"{value/1e6:.2f}M"
+            return str(value)
             
-        return name, yield_pct, currency
-    except:
-        return ticker, 0.0, "N/A"
+        rev_formatted = format_currency(revenue)
+
+        return name, yield_pct, currency, pe_ratio, roe, rev_formatted, profit_margin
+    except Exception as e:
+        return ticker, 0.0, "N/A", 0.0, 0.0, "N/A", 0.0
 
 # --- FEE CALCULATOR (MALAYSIA ONLY) ---
 def calculate_min_lots(price_per_unit, ticker):
@@ -126,9 +138,13 @@ def generate_long_term_verdict(stock_data):
     sma200 = stock_data['sma200']
     rsi = stock_data['rsi']
     vol_strong = stock_data['volume_strong']
+    pe = stock_data.get('pe_ratio', 0)
+    roe = stock_data.get('roe', 0)
     
     is_bull_market = sma50 > sma200
     is_price_healthy = price > sma200
+    is_undervalued = (0 < pe < 20)
+    is_efficient = roe > 10
 
     category = ""
     why = ""
@@ -137,9 +153,12 @@ def generate_long_term_verdict(stock_data):
 
     # 1. BULL MARKET
     if is_bull_market and is_price_healthy:
-        if rsi < 55:
-            category = "💎 STRONG BUY (Discount)"
+        if rsi < 55 and is_undervalued and is_efficient:
+            category = "💎 STRONG BUY (Ultimate Value)"
             target_price = price 
+        elif rsi < 55:
+            category = "🟢 BUY (Technical Discount)"
+            target_price = price
         elif rsi > 70:
             category = "✅ HOLD / WAIT (Overheated)"
             target_price = sma50
@@ -179,7 +198,7 @@ def main():
 
     for ticker in tickers:
         # Get Currency along with other info
-        name, div_yield, currency = get_stock_info(ticker)
+        name, div_yield, currency, pe_ratio, roe, revenue, profit_margin = get_stock_info(ticker)
         df = fetch_data(ticker, period)
         
         if not df.empty:
@@ -189,6 +208,10 @@ def main():
                 stats['name'] = name
                 stats['currency'] = currency
                 stats['div_yield'] = div_yield
+                stats['pe_ratio'] = pe_ratio
+                stats['roe'] = roe
+                stats['revenue'] = revenue
+                stats['profit_margin'] = profit_margin
                 stats['analysis'] = generate_long_term_verdict(stats)
                 
                 # Calculate Smart Lots (Only returns data if .KL)
@@ -225,11 +248,13 @@ def main():
         
         print(f"\n🔹 {item['name']} ({item['ticker']})")
         # FORMATTING CHANGE: .3f used below
-        print(f"   Price:      {curr} {price:.3f}  |  Yield: {item['div_yield']:.2f}%")
-        print(f"   Indicators: RSI: {item['rsi']:.1f}  |  Vol: {vol_msg}")
-        print(f"   Trend:      {trend_icon} (SMA50: {sma50:.3f} | SMA200: {sma200:.3f})")
-        print(f"   Verdict:    {a['category']}")
-        print(f"   Target:     {target_str}")
+        print(f"   Price:        {curr} {price:.3f}  |  Yield: {item['div_yield']:.2f}%")
+        print(f"   Fundamentals: PE: {item['pe_ratio']:.2f} (Valuation)  |  ROE: {item['roe']:.2f}% (Efficiency)")
+        print(f"                 Revenue: {item['revenue']} (Last 4 Quarters)  |  Margin: {item['profit_margin']:.2f}% (Profitability)")
+        print(f"   Indicators:   RSI: {item['rsi']:.1f}  |  Vol: {vol_msg}")
+        print(f"   Trend:        {trend_icon} (SMA50: {sma50:.3f} | SMA200: {sma200:.3f})")
+        print(f"   Verdict:      {a['category']}")
+        print(f"   Target:       {target_str}")
         
         # Suggestion Logic
         lots_data = item['smart_lots']
