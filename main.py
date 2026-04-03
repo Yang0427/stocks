@@ -9,7 +9,6 @@ import ta
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTOR-AWARE PE THRESHOLDS
-# Banks and REITs are valued differently from consumer/retail stocks.
 # ─────────────────────────────────────────────────────────────────────────────
 SECTOR_PE_THRESHOLDS = {
     'bank':         {'great': 10, 'ok': 14},
@@ -60,42 +59,33 @@ def fetch_data(ticker, period='2y'):
         return pd.DataFrame()
 
 def check_dividend_consistency(ticker_obj):
-    """
-    Returns (years_paying: int, is_growing: bool)
-    Looks at last 5 years of dividend history.
-    """
+    """Returns (years_paying: int, is_growing: bool) over last 5 years."""
     try:
         divs = ticker_obj.dividends
         if divs.empty:
             return 0, False
-
         if divs.index.tz is None:
             divs.index = divs.index.tz_localize('UTC')
-
         cutoff = pd.Timestamp.now(tz='UTC') - pd.DateOffset(years=5)
         recent = divs[divs.index >= cutoff]
         if recent.empty:
             return 0, False
-
         by_year = recent.groupby(recent.index.year).sum()
         years_paying = len(by_year)
-
         is_growing = False
         if len(by_year) >= 3:
             vals = by_year.values
             is_growing = float(vals[-1]) >= float(vals[-3])
-
         return years_paying, is_growing
     except Exception:
         return 0, False
 
 def get_stock_info(ticker):
-    """Fetches name, yield, currency, fundamentals, and dividend history."""
+    """Fetches name, yield, currency, fundamentals, dividend history."""
     try:
         t = yf.Ticker(ticker)
         info = t.info
 
-        # Name
         long_name  = info.get('longName')
         short_name = info.get('shortName')
         name = (
@@ -104,12 +94,10 @@ def get_stock_info(ticker):
             else (long_name or short_name or ticker)
         )
 
-        # Currency
         if   ticker.endswith('.KL'): currency = "RM"
         elif ticker.endswith('.HK'): currency = "HKD"
         else:                        currency = "USD"
 
-        # Dividend yield
         div_rate      = info.get('dividendRate', 0)
         current_price = info.get('currentPrice', 0) or info.get('previousClose', 0)
         if div_rate and current_price and current_price > 0:
@@ -118,7 +106,6 @@ def get_stock_info(ticker):
             raw = info.get('dividendYield', 0) or 0
             yield_pct = raw * 100 if raw < 1 else raw
 
-        # Fundamentals
         pe_ratio      = info.get('trailingPE') or info.get('forwardPE') or 0.0
         roe           = info.get('returnOnEquity', 0)
         roe           = float(roe) * 100 if roe else 0.0
@@ -133,11 +120,140 @@ def get_stock_info(ticker):
 
         div_years, div_growing = check_dividend_consistency(t)
 
+        # Return ticker_obj and info for timing signals
         return (name, yield_pct, currency, float(pe_ratio), roe,
-                fmt(revenue), profit_margin, div_years, div_growing)
+                fmt(revenue), profit_margin, div_years, div_growing, t, info)
 
     except Exception:
-        return (ticker, 0.0, "N/A", 0.0, 0.0, "N/A", 0.0, 0, False)
+        return (ticker, 0.0, "N/A", 0.0, 0.0, "N/A", 0.0, 0, False, None, {})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TIMING SIGNALS  (short-term only — intentionally separate from score)
+#
+#  Three checks:
+#  1. Ex-dividend countdown — buy before ex-date to collect dividend
+#  2. Earnings date warning — results within 14 days = volatility risk
+#  3. Short-term momentum   — 5-day and 10-day price change
+#
+#  Verdict:
+#   🟢 GOOD    — clean entry, buy full amount
+#   🟡 CAUTION — one risk, consider buying half now
+#   ⏳ WAIT    — multiple risks, wait a week
+# ─────────────────────────────────────────────────────────────────────────────
+def get_timing_signals(ticker_obj, info, df):
+    green  = []   # tailwinds / positive timing
+    yellow = []   # risks / cautions
+    now    = pd.Timestamp.now(tz='UTC')
+
+    # ── 1. EX-DIVIDEND DATE ─────────────────────────────────────────────────
+    try:
+        ex_ts = info.get('exDividendDate')
+        if ex_ts:
+            ex_date  = pd.Timestamp(ex_ts, unit='s', tz='UTC')
+            days_gap = (ex_date - now).days
+            ex_str   = ex_date.strftime('%d %b %Y')
+            div_rate = info.get('dividendRate', 0) or 0
+            per_pmt  = div_rate / 4 if div_rate else 0   # estimate per quarter
+
+            if 0 < days_gap <= 30:
+                amt = f" — collect ~RM {per_pmt:.4f}/share" if per_pmt > 0 else ""
+                green.append(f"📅 Ex-dividend in {days_gap} days ({ex_str}){amt}")
+            elif -5 <= days_gap <= 0:
+                yellow.append(
+                    f"📅 Ex-dividend just passed {abs(days_gap)} day(s) ago "
+                    f"— missed this round, next in ~3 months"
+                )
+            elif days_gap > 30:
+                green.append(f"📅 Next ex-dividend in {days_gap} days ({ex_str}) — no timing urgency")
+    except Exception:
+        pass
+
+    # ── 2. EARNINGS DATE ────────────────────────────────────────────────────
+    try:
+        cal = ticker_obj.calendar
+        e_date = None
+
+        if isinstance(cal, dict):
+            raw = cal.get('Earnings Date') or cal.get('earningsDate')
+            if raw:
+                e_date = pd.Timestamp(raw[0] if isinstance(raw, list) else raw)
+        elif isinstance(cal, pd.DataFrame) and not cal.empty:
+            e_date = pd.Timestamp(cal.columns[0])
+
+        if e_date is not None:
+            if e_date.tz is None:
+                e_date = e_date.tz_localize('UTC')
+            days_to_earn = (e_date - now).days
+            e_str = e_date.strftime('%d %b %Y')
+
+            if 0 <= days_to_earn <= 7:
+                yellow.append(
+                    f"⚡ Earnings in {days_to_earn} day(s) ({e_str}) "
+                    f"— HIGH volatility risk, price can swing ±10%"
+                )
+            elif days_to_earn <= 14:
+                yellow.append(
+                    f"⚡ Earnings in {days_to_earn} days ({e_str}) "
+                    f"— expect price movement after results"
+                )
+            elif days_to_earn <= 45:
+                green.append(
+                    f"📊 Earnings in {days_to_earn} days ({e_str}) "
+                    f"— results coming, watch for upgrades"
+                )
+    except Exception:
+        pass
+
+    # ── 3. SHORT-TERM MOMENTUM ──────────────────────────────────────────────
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            close = df['Close'].iloc[:, 0]
+        else:
+            close = df['Close']
+
+        if len(close) >= 10:
+            p_now   = float(close.iloc[-1])
+            p_5d    = float(close.iloc[-5])
+            p_10d   = float(close.iloc[-10])
+            mom_5d  = ((p_now - p_5d)  / p_5d)  * 100
+            mom_10d = ((p_now - p_10d) / p_10d) * 100
+
+            if mom_5d <= -3:
+                green.append(
+                    f"📉 Down {abs(mom_5d):.1f}% in 5 days "
+                    f"— short-term dip, price is lower than last week"
+                )
+            elif mom_5d >= 5:
+                yellow.append(
+                    f"📈 Up {mom_5d:.1f}% in 5 days "
+                    f"— short-term spike, may pull back slightly"
+                )
+            else:
+                green.append(f"➡️  Stable {mom_5d:+.1f}% over 5 days — no short-term spike")
+
+            if mom_10d <= -5:
+                green.append(
+                    f"📉 Down {abs(mom_10d):.1f}% over 10 days "
+                    f"— extended pullback, entry looks timely"
+                )
+            elif mom_10d >= 8:
+                yellow.append(
+                    f"📈 Up {mom_10d:.1f}% over 10 days "
+                    f"— check if you're buying into a recent run-up"
+                )
+    except Exception:
+        pass
+
+    # ── OVERALL TIMING VERDICT ───────────────────────────────────────────────
+    n_yellow = len(yellow)
+    if n_yellow >= 2:
+        verdict = "⏳ WAIT"
+    elif n_yellow == 1:
+        verdict = "🟡 CAUTION"
+    else:
+        verdict = "🟢 GOOD"
+
+    return green, yellow, verdict
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FEE CALCULATOR (BURSA / MALAYSIA ONLY)
@@ -145,7 +261,6 @@ def get_stock_info(ticker):
 def calculate_min_lots(price_per_unit, ticker):
     if not ticker.endswith('.KL'):
         return None
-
     for lots in range(1, 100):
         total_value  = price_per_unit * 100 * lots
         stamp_duty   = max(math.ceil(total_value / 1000), 1)
@@ -155,7 +270,6 @@ def calculate_min_lots(price_per_unit, ticker):
         fee_pct      = (total_fee / total_value) * 100
         if fee_pct < 1.0:
             return {'lots': lots, 'cost': total_value, 'fee_pct': fee_pct}
-
     return {'lots': 1, 'cost': price_per_unit * 100, 'fee_pct': 100.0}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,42 +278,26 @@ def calculate_min_lots(price_per_unit, ticker):
 def analyze_stock(df):
     if len(df) < 200:
         return None
-
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
     df['RSI']     = ta.momentum.rsi(df['Close'], window=14)
     df['SMA_50']  = ta.trend.sma_indicator(df['Close'], window=50)
     df['SMA_200'] = ta.trend.sma_indicator(df['Close'], window=200)
     df['Vol_Avg'] = df['Volume'].rolling(window=20).mean()
-
-    latest = df.iloc[-1]
-
-    # 52-week high/low from available data (up to last 252 trading days)
-    lookback    = min(252, len(df))
-    week52_high = float(df['High'].iloc[-lookback:].max())
-    week52_low  = float(df['Low'].iloc[-lookback:].min())
-
+    latest   = df.iloc[-1]
+    lookback = min(252, len(df))
     return {
         'price':         float(latest['Close']),
         'rsi':           float(latest['RSI']),
         'sma50':         float(latest['SMA_50']),
         'sma200':        float(latest['SMA_200']),
         'volume_strong': float(latest['Volume']) > float(latest['Vol_Avg']) * 1.5,
-        'week52_high':   week52_high,
-        'week52_low':    week52_low,
+        'week52_high':   float(df['High'].iloc[-lookback:].max()),
+        'week52_low':    float(df['Low'].iloc[-lookback:].min()),
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAVINGS SCORE ENGINE  (max 100 pts)
-#
-#  Trend        0–15   Golden cross = baseline safety check
-#  Entry        0–20   How deep is the pullback from 52w high?
-#  Valuation    0–15   Sector-aware PE bands
-#  Yield        0–15   Higher dividend yield = higher score
-#  ROE          0–10   Return on equity efficiency
-#  Dividend     0–15   Consistency + growth history
-#  Rotation     0–10   Sector diversification from last purchase
+# SAVINGS SCORE ENGINE  (max 100 pts — long-term fundamentals only)
 # ─────────────────────────────────────────────────────────────────────────────
 def calculate_savings_score(stock_data, sector, last_sector):
     price       = stock_data['price']
@@ -215,61 +313,42 @@ def calculate_savings_score(stock_data, sector, last_sector):
     score = 0
     bd    = {}
 
-    # 1. Trend: golden cross (0 or 15)
-    trend_pts    = 15 if sma50 > sma200 else 0
-    score       += trend_pts
-    bd['trend']  = trend_pts
+    trend_pts   = 15 if sma50 > sma200 else 0
+    score      += trend_pts
+    bd['trend'] = trend_pts
 
-    # 2. Entry quality: pullback from 52w high (0–20)
-    pullback      = ((week52_high - price) / week52_high * 100) if week52_high > 0 else 0
-    entry_pts     = round(min(pullback * 0.8, 20))
-    score        += entry_pts
-    bd['entry']   = entry_pts
+    pullback    = ((week52_high - price) / week52_high * 100) if week52_high > 0 else 0
+    entry_pts   = round(min(pullback * 0.8, 20))
+    score      += entry_pts
+    bd['entry'] = entry_pts
 
-    # 3. Valuation: sector-aware PE (0–15)
     thresh = SECTOR_PE_THRESHOLDS.get(sector, SECTOR_PE_THRESHOLDS['general'])
-    if pe <= 0 or pe > 200:
-        val_pts = 0      # missing, negative, or extreme — can't score
-    elif pe < thresh['great']:
-        val_pts = 15
-    elif pe < thresh['ok']:
-        val_pts = 8
-    else:
-        val_pts = 2
+    val_pts = 0 if (pe <= 0 or pe > 200) else 15 if pe < thresh['great'] else 8 if pe < thresh['ok'] else 2
     score          += val_pts
     bd['valuation'] = val_pts
 
-    # 4. Yield (0–15): 7.5%+ yield = full marks
-    yield_pts    = round(min(div_yield * 2, 15))
-    score       += yield_pts
-    bd['yield']  = yield_pts
+    yield_pts   = round(min(div_yield * 2, 15))
+    score      += yield_pts
+    bd['yield'] = yield_pts
 
-    # 5. ROE / efficiency (0–10)
-    roe_pts    = 10 if roe > 12 else 5 if roe > 8 else 2 if roe > 0 else 0
+    roe_pts   = 10 if roe > 12 else 5 if roe > 8 else 2 if roe > 0 else 0
     score     += roe_pts
-    bd['roe']  = roe_pts
+    bd['roe'] = roe_pts
 
-    # 6. Dividend consistency (0–15)
     div_pts = 15 if div_years >= 5 else 10 if div_years >= 3 else 5 if div_years >= 1 else 0
     if div_growing and div_pts > 0:
-        div_pts = min(div_pts + 3, 15)   # bonus for growing dividend
+        div_pts = min(div_pts + 3, 15)
     score          += div_pts
     bd['dividend']  = div_pts
 
-    # 7. Sector rotation (0–10)
-    if last_sector is None:
-        rot_pts = 5     # no history yet — neutral
-    elif sector != last_sector:
-        rot_pts = 10    # different sector = diversification bonus
-    else:
-        rot_pts = 0     # same sector as last month = no bonus
-    score           += rot_pts
-    bd['rotation']   = rot_pts
+    rot_pts = 5 if last_sector is None else 10 if sector != last_sector else 0
+    score          += rot_pts
+    bd['rotation']  = rot_pts
 
     return round(score), bd
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TREND LABEL
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def trend_label(sma50, sma200, price):
     if sma50 > sma200 and price > sma200:
@@ -279,13 +358,10 @@ def trend_label(sma50, sma200, price):
     else:
         return "💀 DEATH cross"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PE SANITY FLAG
-# ─────────────────────────────────────────────────────────────────────────────
 def pe_flag(pe):
-    if pe <= 0:    return " ⚠️ N/A"
-    if pe < 3:     return " ⚠️ Suspect data"
-    if pe > 200:   return " ⚠️ Extreme"
+    if pe <= 0:  return " ⚠️ N/A"
+    if pe < 3:   return " ⚠️ Suspect data"
+    if pe > 200: return " ⚠️ Extreme"
     return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,8 +376,7 @@ def main():
     period       = config.get('period', '2y')
     purchase_log = load_purchase_log()
     last_sector  = get_last_sector(purchase_log)
-
-    results = []
+    results      = []
 
     print(f"\n🚀 SAVINGS SCOUT — fetching {len(tickers_cfg)} stocks...\n")
 
@@ -310,7 +385,8 @@ def main():
         sector = entry.get('sector', 'general')
 
         (name, div_yield, currency, pe_ratio, roe,
-         revenue, profit_margin, div_years, div_growing) = get_stock_info(ticker)
+         revenue, profit_margin, div_years, div_growing,
+         ticker_obj, info) = get_stock_info(ticker)
 
         df = fetch_data(ticker, period)
         if df.empty:
@@ -319,33 +395,36 @@ def main():
 
         stats = analyze_stock(df)
         if not stats:
-            print(f"⚠️  {ticker}: not enough data (need 200 days)\n")
+            print(f"⚠️  {ticker}: not enough data\n")
             continue
 
+        t_green, t_yellow, t_verdict = get_timing_signals(ticker_obj, info, df)
+
         stats.update({
-            'ticker':        ticker,
-            'sector':        sector,
-            'name':          name,
-            'currency':      currency,
-            'div_yield':     div_yield,
-            'pe_ratio':      pe_ratio,
-            'roe':           roe,
-            'revenue':       revenue,
-            'profit_margin': profit_margin,
-            'div_years':     div_years,
-            'div_growing':   div_growing,
-            'smart_lots':    calculate_min_lots(stats['price'], ticker),
+            'ticker':         ticker,
+            'sector':         sector,
+            'name':           name,
+            'currency':       currency,
+            'div_yield':      div_yield,
+            'pe_ratio':       pe_ratio,
+            'roe':            roe,
+            'revenue':        revenue,
+            'profit_margin':  profit_margin,
+            'div_years':      div_years,
+            'div_growing':    div_growing,
+            'smart_lots':     calculate_min_lots(stats['price'], ticker),
+            'timing_green':   t_green,
+            'timing_yellow':  t_yellow,
+            'timing_verdict': t_verdict,
         })
 
         score, breakdown = calculate_savings_score(stats, sector, last_sector)
         stats['score']     = score
         stats['breakdown'] = breakdown
-
         results.append(stats)
-        print()    # newline after each ticker fetch line
+        print()
         time.sleep(0.5)
 
-    # Sort by score — best pick is #1
     results.sort(key=lambda x: x['score'], reverse=True)
 
     # ── REPORT ───────────────────────────────────────────────────────────────
@@ -359,8 +438,7 @@ def main():
     if purchase_log:
         last = purchase_log[-1]
         print(f"   Last stock bought    : {last.get('ticker')} @ "
-              f"{last.get('currency','RM')} {last.get('price','?')} "
-              f"({last.get('month','?')})")
+              f"{last.get('currency','RM')} {last.get('price','?')} ({last.get('month','?')})")
     print()
 
     medals = {0: "🥇 TOP PICK", 1: "🥈 RUNNER-UP", 2: "🥉 THIRD"}
@@ -372,12 +450,8 @@ def main():
         curr     = item['currency']
         score    = item['score']
         bd       = item['breakdown']
-        pullback = (
-            (item['week52_high'] - price) / item['week52_high'] * 100
-            if item['week52_high'] > 0 else 0
-        )
+        pullback = (item['week52_high'] - price) / item['week52_high'] * 100 if item['week52_high'] > 0 else 0
 
-        # Section headers
         if rank in medals:
             print("─" * W)
             print(f"  {medals[rank]}  (Score: {score}/100)")
@@ -385,49 +459,57 @@ def main():
             print("─" * W)
             print("  📋  FULL WATCHLIST")
 
-        # Score bar
         filled = round(score / 5)
         bar    = "█" * filled + "░" * (20 - filled)
 
-        # Dividend label
         if   item['div_years'] >= 5: div_str = f"✅ {item['div_years']} yrs"
         elif item['div_years'] >= 1: div_str = f"⚠️  {item['div_years']} yr(s) only"
         else:                         div_str = "❌ No history"
         if item['div_growing'] and item['div_years'] >= 1:
             div_str += " 📈 growing"
 
-        # ROE display — flag if zero (likely missing data)
         roe_display = f"{item['roe']:.2f}%" if item['roe'] > 0 else "N/A (missing)"
 
         print(f"\n  {item['name']} ({item['ticker']})  [{item['sector'].upper()}]")
         print(f"  [{bar}] {score}/100")
-        print(f"  Price:    {curr} {price:.3f}  |  52w High: {curr} {item['week52_high']:.3f}  |  "
-              f"Pullback: {pullback:.1f}%")
-        print(f"  Yield:    {item['div_yield']:.2f}%  |  RSI: {item['rsi']:.1f} (info only)  |  "
-              f"Vol: {'🔥 HIGH' if item['volume_strong'] else 'Normal'}")
-        print(f"  PE:       {item['pe_ratio']:.2f}{pe_flag(item['pe_ratio'])}  |  "
-              f"ROE: {roe_display}  |  Margin: {item['profit_margin']:.2f}%")
+        print(f"  Price:    {curr} {price:.3f}  |  52w High: {curr} {item['week52_high']:.3f}  |  Pullback: {pullback:.1f}%")
+        print(f"  Yield:    {item['div_yield']:.2f}%  |  RSI: {item['rsi']:.1f} (info only)  |  Vol: {'🔥 HIGH' if item['volume_strong'] else 'Normal'}")
+        print(f"  PE:       {item['pe_ratio']:.2f}{pe_flag(item['pe_ratio'])}  |  ROE: {roe_display}  |  Margin: {item['profit_margin']:.2f}%")
         print(f"  Revenue:  {item['revenue']} (TTM)  |  Sector PE bands: "
               f"Great <{SECTOR_PE_THRESHOLDS.get(item['sector'],{}).get('great','?')}  "
               f"OK <{SECTOR_PE_THRESHOLDS.get(item['sector'],{}).get('ok','?')}")
         print(f"  Trend:    {trend_label(sma50, sma200, price)}")
         print(f"            SMA50: {sma50:.3f}  |  SMA200: {sma200:.3f}")
         print(f"  Dividend: {div_str}")
-        print(f"  Score breakdown →  "
-              f"Trend: {bd['trend']}  Entry: {bd['entry']}  PE: {bd['valuation']}  "
-              f"Yield: {bd['yield']}  ROE: {bd['roe']}  Div: {bd['dividend']}  "
-              f"Rotation: {bd['rotation']}")
+        print(f"  Score:    Trend={bd['trend']} | Entry={bd['entry']} | PE={bd['valuation']} | "
+              f"Yield={bd['yield']} | ROE={bd['roe']} | Div={bd['dividend']} | Rotation={bd['rotation']}")
 
-        # Buy / Skip suggestion
-        lots = item['smart_lots']
-        if sma50 > sma200:
-            if lots:
-                print(f"  🛒 SUGGESTED BUY: {lots['lots']} lot(s)  →  "
-                      f"{curr} {lots['cost']:.2f}  (fee: {lots['fee_pct']:.2f}%)")
-            else:
-                print(f"  🛒 SUGGESTED BUY: 1 unit  →  {curr} {price:.3f}")
+        # ── TIMING BLOCK ─────────────────────────────────────────────────────
+        tv = item['timing_verdict']
+        print(f"  ┌─ TIMING: {tv} " + "─" * max(0, 56 - len(tv)))
+        for g in item['timing_green']:
+            print(f"  │  ✔ {g}")
+        for y in item['timing_yellow']:
+            print(f"  │  ✘ {y}")
+        if not item['timing_green'] and not item['timing_yellow']:
+            print(f"  │  (No timing data available)")
+
+        is_golden = sma50 > sma200
+        lots      = item['smart_lots']
+
+        if not is_golden:
+            print(f"  └─ ⛔ SKIP: Death cross — wait for trend reversal first")
+        elif tv == "⏳ WAIT":
+            print(f"  └─ ⏳ WAIT: Multiple short-term risks — revisit in 1–2 weeks")
+        elif tv == "🟡 CAUTION":
+            half = max(1, (lots['lots'] // 2)) if lots else 1
+            half_cost = half * 100 * price
+            print(f"  └─ 🟡 BUY HALF NOW: {half} lot(s) → {curr} {half_cost:.2f}  |  Hold remaining for after risk clears")
         else:
-            print(f"  ⛔ SKIP THIS MONTH: Death cross — wait for trend to reverse")
+            if lots:
+                print(f"  └─ 🟢 BUY FULL: {lots['lots']} lot(s) → {curr} {lots['cost']:.2f}  (fee: {lots['fee_pct']:.2f}%)")
+            else:
+                print(f"  └─ 🟢 BUY FULL: 1 unit → {curr} {price:.3f}")
 
         print()
 
@@ -447,7 +529,7 @@ def main():
     if results:
         top  = results[0]
         lots = top['smart_lots']
-        entry = {
+        log_entry = {
             "month":    datetime.now().strftime("%Y-%m"),
             "ticker":   top['ticker'],
             "sector":   top['sector'],
@@ -455,7 +537,7 @@ def main():
             "currency": top['currency'],
             "lots":     lots['lots'] if lots else 1,
         }
-        print(f"   {json.dumps(entry)}")
+        print(f"   {json.dumps(log_entry)}")
 
     print("\n✅ Done. Run again next payday.\n")
 
