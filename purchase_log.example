@@ -1,0 +1,5 @@
+# purchase_log.json
+[
+  {"month": "2025-03", "ticker": "1155.KL", "sector": "bank", "price": 10.80},
+  {"month": "2025-04", "ticker": "5176.KL", "sector": "reit", "price": 2.31}
+]
