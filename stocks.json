@@ -24,6 +24,19 @@
     { "ticker": "9466.KL", "sector": "industrial"   },
     { "ticker": "8206.KL", "sector": "property"     },
     { "ticker": "4715.KL", "sector": "consumer"     },
-    { "ticker": "3182.KL", "sector": "conglomerate" }
+    { "ticker": "3182.KL", "sector": "conglomerate" },
+    { "ticker": "6012.KL", "sector": "telco"        },
+    { "ticker": "4863.KL", "sector": "telco"        },
+    { "ticker": "6033.KL", "sector": "energy"       },
+    { "ticker": "7277.KL", "sector": "energy"       },
+    { "ticker": "4707.KL", "sector": "consumer"     },
+    { "ticker": "7084.KL", "sector": "consumer"     },
+    { "ticker": "7113.KL", "sector": "healthcare"   },
+    { "ticker": "5168.KL", "sector": "healthcare"   },
+    { "ticker": "0208.KL", "sector": "tech"         },
+    { "ticker": "3867.KL", "sector": "tech"         },
+    { "ticker": "5227.KL", "sector": "reit"         },
+    { "ticker": "5238.KL", "sector": "travel"       },
+    { "ticker": "5099.KL", "sector": "travel"       }
   ]
 }

@@ -43,8 +43,158 @@ def load_purchase_log():
     except FileNotFoundError:
         return []
 
-def get_last_sector(log):
-    return log[-1].get('sector') if log else None
+def load_sell_log():
+    try:
+        with open('sell_log.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+def build_ticker_sector_map(tickers_cfg):
+    mapping = {}
+    for entry in tickers_cfg:
+        ticker = entry.get('ticker')
+        sector = entry.get('sector')
+        if ticker and sector:
+            mapping[ticker] = sector
+    return mapping
+
+def get_last_sector(log, ticker_sector_map):
+    if not log:
+        return None
+    for entry in reversed(log):
+        ticker = entry.get('ticker')
+        if entry.get('sector'):
+            return entry.get('sector')
+        if ticker in ticker_sector_map:
+            return ticker_sector_map[ticker]
+    return None
+
+def units_per_lot(ticker):
+    return 100 if ticker.endswith('.KL') else 1
+
+def build_open_positions(purchase_log, sell_log, ticker_sector_map):
+    buy_queues = {}
+    realized_by_ticker = {}
+    errors = []
+
+    for buy in purchase_log:
+        ticker = buy.get('ticker')
+        price = buy.get('price')
+        lots = buy.get('lots')
+        currency = buy.get('currency')
+        month = buy.get('month', 'N/A')
+        sector = buy.get('sector')
+
+        if not ticker or price is None or lots is None or not currency:
+            errors.append(f"Buy entry missing required fields: {buy}")
+            continue
+
+        if not sector:
+            sector = ticker_sector_map.get(ticker)
+            if not sector:
+                errors.append(f"{ticker}: Sector missing in purchase_log and not found in stocks.json")
+                continue
+
+        try:
+            price = float(price)
+            lots = int(lots)
+        except (TypeError, ValueError):
+            errors.append(f"{ticker}: Invalid buy entry types for price/lots: {buy}")
+            continue
+
+        if price <= 0 or lots <= 0:
+            errors.append(f"{ticker}: Buy entry must have positive price/lots: {buy}")
+            continue
+
+        buy_queues.setdefault(ticker, []).append({
+            'lots_remaining': lots,
+            'buy_price': price,
+            'currency': currency,
+            'month': month,
+            'sector': sector,
+        })
+
+    for sell in sell_log:
+        ticker = sell.get('ticker')
+        price = sell.get('price')
+        lots = sell.get('lots')
+        currency = sell.get('currency')
+
+        if not ticker or price is None or lots is None or not currency:
+            errors.append(f"Sell entry missing required fields: {sell}")
+            continue
+
+        try:
+            price = float(price)
+            lots = int(lots)
+        except (TypeError, ValueError):
+            errors.append(f"{ticker}: Invalid sell entry types for price/lots: {sell}")
+            continue
+
+        if price <= 0 or lots <= 0:
+            errors.append(f"{ticker}: Sell entry must have positive price/lots: {sell}")
+            continue
+
+        if ticker not in buy_queues or not buy_queues[ticker]:
+            errors.append(f"{ticker}: Sell exists but no matching buys available")
+            continue
+
+        if buy_queues[ticker][0]['currency'] != currency:
+            errors.append(f"{ticker}: Currency mismatch between buy log and sell log")
+            continue
+
+        lots_to_match = lots
+        realized = realized_by_ticker.setdefault(ticker, {'value': 0.0, 'currency': currency})
+        unit_size = units_per_lot(ticker)
+
+        while lots_to_match > 0 and buy_queues[ticker]:
+            oldest_buy = buy_queues[ticker][0]
+            matched_lots = min(lots_to_match, oldest_buy['lots_remaining'])
+            pnl_per_unit = price - oldest_buy['buy_price']
+            realized['value'] += pnl_per_unit * matched_lots * unit_size
+
+            oldest_buy['lots_remaining'] -= matched_lots
+            lots_to_match -= matched_lots
+
+            if oldest_buy['lots_remaining'] == 0:
+                buy_queues[ticker].pop(0)
+
+        if lots_to_match > 0:
+            errors.append(f"{ticker}: Sell lots exceed available open lots by {lots_to_match}")
+
+    open_positions = []
+    for ticker, queue in buy_queues.items():
+        remaining = [b for b in queue if b['lots_remaining'] > 0]
+        if not remaining:
+            continue
+
+        currencies = {b['currency'] for b in remaining}
+        if len(currencies) != 1:
+            errors.append(f"{ticker}: Open position has mixed currencies; cannot evaluate")
+            continue
+
+        currency = remaining[0]['currency']
+        unit_size = units_per_lot(ticker)
+        total_lots = sum(b['lots_remaining'] for b in remaining)
+        total_units = total_lots * unit_size
+        total_cost = sum(b['buy_price'] * b['lots_remaining'] * unit_size for b in remaining)
+        avg_buy = total_cost / total_units if total_units > 0 else 0.0
+        first_month = remaining[0].get('month', 'N/A')
+        sector = remaining[0].get('sector')
+
+        open_positions.append({
+            'ticker': ticker,
+            'currency': currency,
+            'sector': sector,
+            'open_lots': total_lots,
+            'open_units': total_units,
+            'avg_buy_price': avg_buy,
+            'first_month': first_month,
+            'realized_pnl': realized_by_ticker.get(ticker, {'value': 0.0, 'currency': currency}),
+        })
+
+    return open_positions, realized_by_ticker, errors
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA FETCHING
@@ -364,6 +514,27 @@ def pe_flag(pe):
     if pe > 200: return " ⚠️ Extreme"
     return ""
 
+def evaluate_holding_signal(buy_price, current_price, rsi):
+    if buy_price <= 0:
+        return ("❌ ERROR", "Invalid buy price in purchase_log.json")
+    if pd.isna(rsi):
+        return ("❌ ERROR", "RSI unavailable; cannot produce sell verdict")
+
+    gain_pct = ((current_price - buy_price) / buy_price) * 100
+    take_profit_price = buy_price * 1.15
+    trim_price = buy_price * 1.10
+    cut_loss_price = buy_price * 0.92
+
+    if current_price <= cut_loss_price:
+        return ("🛑 CUT LOSS", f"Price is at/below 8% stop ({cut_loss_price:.3f})")
+    if current_price >= take_profit_price and rsi > 70:
+        return ("🔴 TAKE PROFIT", f"Gain {gain_pct:.1f}% and RSI {rsi:.1f} > 70")
+    if current_price >= trim_price and 65 <= rsi <= 70:
+        return ("🟡 TRIM", f"Gain {gain_pct:.1f}% with RSI {rsi:.1f} in 65–70 zone")
+    if rsi > 70 and current_price < trim_price:
+        return ("🟠 WATCH", f"RSI {rsi:.1f} is overbought; gain not yet 10%")
+    return ("✅ HOLD", f"Trend condition healthy for now (RSI {rsi:.1f})")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -374,8 +545,10 @@ def main():
 
     tickers_cfg  = config.get('tickers', [])
     period       = config.get('period', '2y')
+    ticker_sector_map = build_ticker_sector_map(tickers_cfg)
     purchase_log = load_purchase_log()
-    last_sector  = get_last_sector(purchase_log)
+    sell_log     = load_sell_log()
+    last_sector  = get_last_sector(purchase_log, ticker_sector_map)
     results      = []
 
     print(f"\n🚀 SAVINGS SCOUT — fetching {len(tickers_cfg)} stocks...\n")
@@ -522,6 +695,72 @@ def main():
         flag = "  ← bought last month" if sec == last_sector else ""
         print(f"   {sec.upper():15}  {count} stock(s){flag}")
 
+    # ── HOLDINGS REVIEW (SELL SIGNALS) ───────────────────────────────────────
+    print("\n" + "─" * W)
+    print("📈  HOLDINGS REVIEW — SELL SIGNALS")
+    open_positions, realized_by_ticker, txn_errors = build_open_positions(
+        purchase_log, sell_log, ticker_sector_map
+    )
+    if txn_errors:
+        print("   ⚠️ Transaction log issues detected:")
+        for err in txn_errors:
+            print(f"   - {err}")
+
+    if not purchase_log:
+        print("   No holdings in purchase_log.json")
+    elif not sell_log:
+        print("   ℹ️ sell_log.json not found or empty: treating all buys as open positions")
+
+    if not open_positions:
+        if purchase_log:
+            print("   No open positions after reconciling buys/sells")
+    else:
+        for pos in open_positions:
+            ticker = pos['ticker']
+            buy_price = pos['avg_buy_price']
+            curr = pos['currency']
+            open_lots = pos['open_lots']
+            open_units = pos['open_units']
+            month = pos['first_month']
+            (stock_name, _, _, _, _, _, _, _, _, _, _) = get_stock_info(ticker)
+
+            df_h = fetch_data(ticker, period)
+            if df_h.empty:
+                print(f"   ❌ {ticker}: No market data, cannot evaluate sell signal")
+                continue
+
+            stats_h = analyze_stock(df_h)
+            if not stats_h:
+                print(f"   ❌ {ticker}: Not enough data to calculate RSI/SMA")
+                continue
+
+            current_price = stats_h['price']
+            rsi = stats_h['rsi']
+            pnl_pct = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else float('nan')
+            pnl_per_share = current_price - buy_price
+            unrealized_total = pnl_per_share * open_units
+            realized_total = pos['realized_pnl']['value']
+
+            verdict, reason = evaluate_holding_signal(buy_price, current_price, rsi)
+            sign = "+" if pnl_pct >= 0 else ""
+
+            print(f"\n   {stock_name} ({ticker}) (first open lot from {month})")
+            print(f"   Open: {open_lots} lot(s) / {open_units} unit(s)")
+            print(f"   Avg Buy: {curr} {buy_price:.3f} | Now: {curr} {current_price:.3f} | RSI: {rsi:.1f}")
+            print(f"   Unrealized P/L: {sign}{pnl_pct:.2f}% ({curr} {pnl_per_share:+.3f}/unit, total {curr} {unrealized_total:+.2f})")
+            print(f"   Realized P/L: {curr} {realized_total:+.2f}")
+            print(f"   Verdict: {verdict} — {reason}")
+
+    closed_realized = [
+        (ticker, data['value'], data['currency'])
+        for ticker, data in realized_by_ticker.items()
+        if ticker not in {p['ticker'] for p in open_positions}
+    ]
+    if closed_realized:
+        print("\n   Closed positions (already fully sold):")
+        for ticker, value, currency in closed_realized:
+            print(f"   - {ticker}: Realized P/L {currency} {value:+.2f}")
+
     # ── LOG HELPER ───────────────────────────────────────────────────────────
     print("\n" + "─" * W)
     print("📝  TO LOG THIS MONTH'S PURCHASE")
@@ -532,7 +771,6 @@ def main():
         log_entry = {
             "month":    datetime.now().strftime("%Y-%m"),
             "ticker":   top['ticker'],
-            "sector":   top['sector'],
             "price":    round(top['price'], 3),
             "currency": top['currency'],
             "lots":     lots['lots'] if lots else 1,
