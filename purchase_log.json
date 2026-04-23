@@ -1,4 +1,7 @@
 [
-   {"month": "2026-04", "ticker": "5248.KL", "sector": "auto", "price": 0.88, "currency": "RM", "lots": 5}
+   {"month": "2026-04", "ticker": "5248.KL", "sector": "auto", "price": 0.875, "currency": "RM", "lots": 5},
+   {"month": "2026-04", "ticker": "5296.KL", "sector": "retail", "price": 1.50, "currency": "RM", "lots": 3},
+   {"month": "2026-03", "ticker": "5176.KL", "sector": "reit", "price": 2.45, "currency": "RM", "lots": 2},
+   {"month": "2026-02", "ticker": "5212.KL", "sector": "reit", "price": 1.93, "currency": "RM", "lots": 3}
 
 ]
