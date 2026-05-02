@@ -54,6 +54,34 @@ def build_ticker_sector_map(tickers_cfg):
             mapping[ticker] = sector
     return mapping
 
+# yfinance returns sector strings like "Financial Services", "Real Estate", etc.
+# Map them to the internal keys used in SECTOR_PE_THRESHOLDS.
+_YFINANCE_SECTOR_MAP = {
+    'financial services': 'bank',
+    'financials':         'bank',
+    'banking':            'bank',
+    'real estate':        'reit',
+    'communication services': 'telco',
+    'telecommunications': 'telco',
+    'utilities':          'utilities',
+    'energy':             'energy',
+}
+
+def infer_sector_from_yfinance(ticker):
+    """
+    Fetch sector from yfinance and map to an internal sector name.
+    Falls back to 'general' if unrecognised.
+    """
+    try:
+        info = yf.Ticker(ticker).info
+        raw = (info.get('sector') or info.get('industry') or '').lower()
+        for key, internal in _YFINANCE_SECTOR_MAP.items():
+            if key in raw:
+                return internal
+    except Exception:
+        pass
+    return 'general'
+
 def get_recent_sectors(log, ticker_sector_map, n=3):
     """Return the sectors of the last n purchases (most recent first)."""
     if not log:
@@ -63,6 +91,8 @@ def get_recent_sectors(log, ticker_sector_map, n=3):
     for entry in sorted_log[:n]:
         ticker = entry.get('ticker')
         sector = entry.get('sector') or ticker_sector_map.get(ticker)
+        if not sector:
+            sector = infer_sector_from_yfinance(ticker)
         if sector:
             sectors.append(sector)
     return sectors
@@ -76,7 +106,7 @@ def get_last_sector(log, ticker_sector_map):
         return latest.get('sector')
     if ticker in ticker_sector_map:
         return ticker_sector_map[ticker]
-    return None
+    return infer_sector_from_yfinance(ticker)
 
 def get_months_since_last_buy(log, ticker):
     """Return how many months ago this ticker was last purchased, or None."""
@@ -115,8 +145,8 @@ def build_open_positions(purchase_log, sell_log, ticker_sector_map):
         if not sector:
             sector = ticker_sector_map.get(ticker)
             if not sector:
-                errors.append(f"{ticker}: Sector missing in purchase_log and not found in stocks.json")
-                continue
+                sector = infer_sector_from_yfinance(ticker)
+                print(f"   ℹ️  {ticker}: sector not in stocks.json — inferred '{sector}' from yfinance")
 
         try:
             price = float(price)
@@ -159,7 +189,10 @@ def build_open_positions(purchase_log, sell_log, ticker_sector_map):
             continue
 
         if ticker not in buy_queues or not buy_queues[ticker]:
-            errors.append(f"{ticker}: Sell exists but no matching buys available")
+            errors.append(
+                f"{ticker}: Sell of {lots} lot(s) @ {currency} {price:.3f} has no matching buy record "
+                f"— add the original buy to purchase_log.json if you want P/L tracking"
+            )
             continue
 
         if buy_queues[ticker][0]['currency'] != currency:

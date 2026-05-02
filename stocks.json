@@ -16,6 +16,8 @@
     { "ticker": "5347.KL", "sector": "utilities" },
     { "ticker": "6033.KL", "sector": "energy"    },
     { "ticker": "6947.KL", "sector": "telco"     },
-    { "ticker": "4863.KL", "sector": "telco"     }
+    { "ticker": "4863.KL", "sector": "telco"     },
+    { "ticker": "5248.KL", "sector": "general"   },
+    { "ticker": "5296.KL", "sector": "general"   }
   ]
 }
