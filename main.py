@@ -1,6 +1,7 @@
 import json
 import math
 import time
+from collections import Counter
 from datetime import datetime
 
 import yfinance as yf
@@ -11,18 +12,12 @@ import ta
 # SECTOR-AWARE PE THRESHOLDS
 # ─────────────────────────────────────────────────────────────────────────────
 SECTOR_PE_THRESHOLDS = {
-    'bank':         {'great': 10, 'ok': 14},
-    'reit':         {'great': 14, 'ok': 18},
-    'consumer':     {'great': 15, 'ok': 22},
-    'telco':        {'great': 18, 'ok': 25},
-    'utilities':    {'great': 18, 'ok': 25},
-    'property':     {'great': 10, 'ok': 15},
-    'industrial':   {'great': 15, 'ok': 22},
-    'tech':         {'great': 25, 'ok': 35},
-    'auto':         {'great': 10, 'ok': 15},
-    'retail':       {'great': 20, 'ok': 30},
-    'conglomerate': {'great': 12, 'ok': 18},
-    'general':      {'great': 15, 'ok': 20},
+    'bank':      {'great': 10, 'ok': 14},
+    'reit':      {'great': 14, 'ok': 18},
+    'telco':     {'great': 18, 'ok': 25},
+    'utilities': {'great': 18, 'ok': 25},
+    'energy':    {'great': 15, 'ok': 22},
+    'general':   {'great': 15, 'ok': 20},
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,16 +54,43 @@ def build_ticker_sector_map(tickers_cfg):
             mapping[ticker] = sector
     return mapping
 
+def get_recent_sectors(log, ticker_sector_map, n=3):
+    """Return the sectors of the last n purchases (most recent first)."""
+    if not log:
+        return []
+    sorted_log = sorted(log, key=lambda e: e.get('month', ''), reverse=True)
+    sectors = []
+    for entry in sorted_log[:n]:
+        ticker = entry.get('ticker')
+        sector = entry.get('sector') or ticker_sector_map.get(ticker)
+        if sector:
+            sectors.append(sector)
+    return sectors
+
 def get_last_sector(log, ticker_sector_map):
     if not log:
         return None
-    for entry in reversed(log):
-        ticker = entry.get('ticker')
-        if entry.get('sector'):
-            return entry.get('sector')
-        if ticker in ticker_sector_map:
-            return ticker_sector_map[ticker]
+    latest = max(log, key=lambda e: e.get('month', ''))
+    ticker = latest.get('ticker')
+    if latest.get('sector'):
+        return latest.get('sector')
+    if ticker in ticker_sector_map:
+        return ticker_sector_map[ticker]
     return None
+
+def get_months_since_last_buy(log, ticker):
+    """Return how many months ago this ticker was last purchased, or None."""
+    entries = [e for e in log if e.get('ticker') == ticker and e.get('month')]
+    if not entries:
+        return None
+    last_month_str = max(e['month'] for e in entries)
+    try:
+        last_dt = datetime.strptime(last_month_str, "%Y-%m")
+        now = datetime.now()
+        months = (now.year - last_dt.year) * 12 + (now.month - last_dt.month)
+        return months
+    except ValueError:
+        return None
 
 def units_per_lot(ticker):
     return 100 if ticker.endswith('.KL') else 1
@@ -231,7 +253,7 @@ def check_dividend_consistency(ticker_obj):
         return 0, False
 
 def get_stock_info(ticker):
-    """Fetches name, yield, currency, fundamentals, dividend history."""
+    """Fetches name, yield, currency, fundamentals, dividend history, and debt ratio."""
     try:
         t = yf.Ticker(ticker)
         info = t.info
@@ -263,6 +285,9 @@ def get_stock_info(ticker):
         profit_margin = info.get('profitMargins', 0)
         profit_margin = float(profit_margin) * 100 if profit_margin else 0.0
 
+        # Debt-to-equity ratio (reported as %, so 150 = 1.5x)
+        debt_to_equity = info.get('debtToEquity') or 0.0
+
         def fmt(v):
             if v >= 1e9: return f"{v/1e9:.2f}B"
             if v >= 1e6: return f"{v/1e6:.2f}M"
@@ -270,20 +295,21 @@ def get_stock_info(ticker):
 
         div_years, div_growing = check_dividend_consistency(t)
 
-        # Return ticker_obj and info for timing signals
         return (name, yield_pct, currency, float(pe_ratio), roe,
-                fmt(revenue), profit_margin, div_years, div_growing, t, info)
+                fmt(revenue), profit_margin, div_years, div_growing,
+                t, info, debt_to_equity)
 
     except Exception:
-        return (ticker, 0.0, "N/A", 0.0, 0.0, "N/A", 0.0, 0, False, None, {})
+        return (ticker, 0.0, "N/A", 0.0, 0.0, "N/A", 0.0, 0, False, None, {}, 0.0)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMING SIGNALS  (short-term only — intentionally separate from score)
 #
-#  Three checks:
+#  Four checks:
 #  1. Ex-dividend countdown — buy before ex-date to collect dividend
-#  2. Earnings date warning — results within 14 days = volatility risk
+#  2. Earnings date warning — future results only (past dates ignored)
 #  3. Short-term momentum   — 5-day and 10-day price change
+#  4. RSI extremes          — overbought >70 or oversold <30
 #
 #  Verdict:
 #   🟢 GOOD    — clean entry, buy full amount
@@ -291,8 +317,8 @@ def get_stock_info(ticker):
 #   ⏳ WAIT    — multiple risks, wait a week
 # ─────────────────────────────────────────────────────────────────────────────
 def get_timing_signals(ticker_obj, info, df):
-    green  = []   # tailwinds / positive timing
-    yellow = []   # risks / cautions
+    green  = []
+    yellow = []
     now    = pd.Timestamp.now(tz='UTC')
 
     # ── 1. EX-DIVIDEND DATE ─────────────────────────────────────────────────
@@ -303,7 +329,7 @@ def get_timing_signals(ticker_obj, info, df):
             days_gap = (ex_date - now).days
             ex_str   = ex_date.strftime('%d %b %Y')
             div_rate = info.get('dividendRate', 0) or 0
-            per_pmt  = div_rate / 4 if div_rate else 0   # estimate per quarter
+            per_pmt  = div_rate / 4 if div_rate else 0
 
             if 0 < days_gap <= 30:
                 amt = f" — collect ~RM {per_pmt:.4f}/share" if per_pmt > 0 else ""
@@ -318,7 +344,7 @@ def get_timing_signals(ticker_obj, info, df):
     except Exception:
         pass
 
-    # ── 2. EARNINGS DATE ────────────────────────────────────────────────────
+    # ── 2. EARNINGS DATE (future only) ──────────────────────────────────────
     try:
         cal = ticker_obj.calendar
         e_date = None
@@ -334,23 +360,25 @@ def get_timing_signals(ticker_obj, info, df):
             if e_date.tz is None:
                 e_date = e_date.tz_localize('UTC')
             days_to_earn = (e_date - now).days
-            e_str = e_date.strftime('%d %b %Y')
 
-            if 0 <= days_to_earn <= 7:
-                yellow.append(
-                    f"⚡ Earnings in {days_to_earn} day(s) ({e_str}) "
-                    f"— HIGH volatility risk, price can swing ±10%"
-                )
-            elif days_to_earn <= 14:
-                yellow.append(
-                    f"⚡ Earnings in {days_to_earn} days ({e_str}) "
-                    f"— expect price movement after results"
-                )
-            elif days_to_earn <= 45:
-                green.append(
-                    f"📊 Earnings in {days_to_earn} days ({e_str}) "
-                    f"— results coming, watch for upgrades"
-                )
+            # Only act on future earnings dates — ignore stale/past data
+            if days_to_earn >= 0:
+                e_str = e_date.strftime('%d %b %Y')
+                if days_to_earn <= 7:
+                    yellow.append(
+                        f"⚡ Earnings in {days_to_earn} day(s) ({e_str}) "
+                        f"— HIGH volatility risk, price can swing ±10%"
+                    )
+                elif days_to_earn <= 14:
+                    yellow.append(
+                        f"⚡ Earnings in {days_to_earn} days ({e_str}) "
+                        f"— expect price movement after results"
+                    )
+                elif days_to_earn <= 45:
+                    green.append(
+                        f"📊 Earnings in {days_to_earn} days ({e_str}) "
+                        f"— results coming, watch for upgrades"
+                    )
     except Exception:
         pass
 
@@ -394,6 +422,27 @@ def get_timing_signals(ticker_obj, info, df):
     except Exception:
         pass
 
+    # ── 4. RSI EXTREMES ─────────────────────────────────────────────────────
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            close_s = df['Close'].iloc[:, 0]
+        else:
+            close_s = df['Close']
+
+        if len(close_s) >= 14:
+            rsi_series = ta.momentum.rsi(close_s, window=14)
+            rsi_val = float(rsi_series.iloc[-1])
+            if rsi_val >= 70:
+                yellow.append(
+                    f"🔴 RSI {rsi_val:.1f} — overbought territory, elevated pullback risk"
+                )
+            elif rsi_val <= 30:
+                green.append(
+                    f"🟢 RSI {rsi_val:.1f} — oversold, potential mean-reversion bounce"
+                )
+    except Exception:
+        pass
+
     # ── OVERALL TIMING VERDICT ───────────────────────────────────────────────
     n_yellow = len(yellow)
     if n_yellow >= 2:
@@ -404,6 +453,44 @@ def get_timing_signals(ticker_obj, info, df):
         verdict = "🟢 GOOD"
 
     return green, yellow, verdict
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBT / LEVERAGE FLAG  (for banks and REITs)
+# ─────────────────────────────────────────────────────────────────────────────
+def debt_flag(sector, debt_to_equity):
+    """
+    Returns (flag_str, is_high_debt).
+    debt_to_equity from yfinance is reported as a percentage (e.g. 150 = 1.5x).
+    Banks are inherently highly leveraged — threshold is much higher.
+    REITs typically run 0.5x–1.5x (50–150%).
+    """
+    if debt_to_equity <= 0:
+        return "N/A", False
+
+    ratio = debt_to_equity / 100  # convert to multiplier
+
+    if sector == 'bank':
+        # Banks operate at 8x–12x leverage normally; flag only extreme cases
+        if ratio > 15:
+            return f"⚠️  D/E {ratio:.1f}x — extremely high even for a bank", True
+        elif ratio > 10:
+            return f"🟡 D/E {ratio:.1f}x — high leverage, monitor capital ratios", False
+        else:
+            return f"✅ D/E {ratio:.1f}x — normal bank leverage", False
+    elif sector == 'reit':
+        if ratio > 1.5:
+            return f"⚠️  D/E {ratio:.1f}x — high gearing for REIT, rate-sensitive", True
+        elif ratio > 0.8:
+            return f"🟡 D/E {ratio:.1f}x — moderate gearing, watch interest coverage", False
+        else:
+            return f"✅ D/E {ratio:.1f}x — conservative gearing", False
+    else:
+        if ratio > 2.0:
+            return f"⚠️  D/E {ratio:.1f}x — high debt load", True
+        elif ratio > 1.0:
+            return f"🟡 D/E {ratio:.1f}x — moderate debt", False
+        else:
+            return f"✅ D/E {ratio:.1f}x — low debt", False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FEE CALCULATOR (BURSA / MALAYSIA ONLY)
@@ -447,9 +534,9 @@ def analyze_stock(df):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAVINGS SCORE ENGINE  (max 100 pts — long-term fundamentals only)
+# SAVINGS SCORE ENGINE  (max ~117 pts — entry can go negative for peak buys)
 # ─────────────────────────────────────────────────────────────────────────────
-def calculate_savings_score(stock_data, sector, last_sector):
+def calculate_savings_score(stock_data, sector, recent_sectors, months_since_last_buy):
     price       = stock_data['price']
     sma50       = stock_data['sma50']
     sma200      = stock_data['sma200']
@@ -463,39 +550,130 @@ def calculate_savings_score(stock_data, sector, last_sector):
     score = 0
     bd    = {}
 
+    rsi = stock_data.get('rsi', 50)
+
+    # ── Trend (15 pts) ───────────────────────────────────────────────────────
     trend_pts   = 15 if sma50 > sma200 else 0
     score      += trend_pts
     bd['trend'] = trend_pts
 
-    pullback    = ((week52_high - price) / week52_high * 100) if week52_high > 0 else 0
-    entry_pts   = round(min(pullback * 0.8, 20))
+    # ── Entry / Pullback (max 30 pts, min -10 pts penalty) ──────────────────
+    # This is the most important factor for a savings investor:
+    # buying near the peak locks in downside risk before dividends can recover it.
+    #
+    # Scoring bands:
+    #   ≥ 20% pullback  → 30 pts  (deep value zone)
+    #   15–20%          → 25 pts
+    #   10–15%          → 20 pts
+    #   5–10%           → 12 pts
+    #   3–5%            → 6 pts
+    #   < 3%            → -10 pts (near 52-week high — penalty, not just zero)
+    #
+    # RSI adjustment: overbought RSI (≥65) cuts entry pts by a further 5
+    # because momentum is stretched and a pullback is statistically likely.
+    pullback = ((week52_high - price) / week52_high * 100) if week52_high > 0 else 0
+    if pullback >= 20:
+        entry_pts = 30
+    elif pullback >= 15:
+        entry_pts = 25
+    elif pullback >= 10:
+        entry_pts = 20
+    elif pullback >= 5:
+        entry_pts = 12
+    elif pullback >= 3:
+        entry_pts = 6
+    else:
+        entry_pts = -10  # buying at/near peak — meaningful penalty
+
+    if rsi >= 65 and entry_pts > 0:
+        entry_pts -= 5   # overbought momentum compounds peak-entry risk
+
     score      += entry_pts
     bd['entry'] = entry_pts
 
+    # ── Valuation / PE (15 pts) ──────────────────────────────────────────────
     thresh = SECTOR_PE_THRESHOLDS.get(sector, SECTOR_PE_THRESHOLDS['general'])
     val_pts = 0 if (pe <= 0 or pe > 200) else 15 if pe < thresh['great'] else 8 if pe < thresh['ok'] else 2
     score          += val_pts
     bd['valuation'] = val_pts
 
-    yield_pts   = round(min(div_yield * 2, 15))
+    # ── Yield (max 20 pts — tiered so higher yield scores better) ───────────
+    if div_yield >= 8:
+        yield_pts = 20
+    elif div_yield >= 6:
+        yield_pts = 16
+    elif div_yield >= 4:
+        yield_pts = 12
+    elif div_yield >= 2:
+        yield_pts = 7
+    else:
+        yield_pts = round(min(div_yield * 2, 6))
     score      += yield_pts
     bd['yield'] = yield_pts
 
+    # ── ROE (10 pts) ─────────────────────────────────────────────────────────
     roe_pts   = 10 if roe > 12 else 5 if roe > 8 else 2 if roe > 0 else 0
     score     += roe_pts
     bd['roe'] = roe_pts
 
+    # ── Dividend history (15 pts) ────────────────────────────────────────────
     div_pts = 15 if div_years >= 5 else 10 if div_years >= 3 else 5 if div_years >= 1 else 0
     if div_growing and div_pts > 0:
         div_pts = min(div_pts + 3, 15)
     score          += div_pts
     bd['dividend']  = div_pts
 
-    rot_pts = 5 if last_sector is None else 10 if sector != last_sector else 0
+    # ── Sector rotation — checks last 3 purchases, not just 1 ────────────────
+    sector_count = recent_sectors.count(sector) if recent_sectors else 0
+    if not recent_sectors:
+        rot_pts = 4
+    elif sector_count == 0:
+        rot_pts = 8      # fresh sector → full bonus
+    elif sector_count == 1:
+        rot_pts = 3      # bought once in last 3 months → small credit
+    else:
+        rot_pts = 0      # bought 2+ times recently → no bonus
     score          += rot_pts
     bd['rotation']  = rot_pts
 
+    # ── Freshness bonus — reward stocks not bought in a long time ─────────────
+    if months_since_last_buy is None:
+        fresh_pts = 4    # never bought → fresh pick
+    elif months_since_last_buy >= 6:
+        fresh_pts = 4    # dormant for 6+ months → accumulate again
+    elif months_since_last_buy >= 3:
+        fresh_pts = 2
+    else:
+        fresh_pts = 0    # bought very recently
+    score           += fresh_pts
+    bd['freshness']  = fresh_pts
+
     return round(score), bd
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EFFECTIVE RANK  (score adjusted for actionability)
+# ─────────────────────────────────────────────────────────────────────────────
+def effective_score(item):
+    """
+    Demote stocks that cannot be acted on this month so the displayed order
+    reflects what you should actually buy, not just the best fundamentals.
+      - Death cross (not golden)  → heavily demoted
+      - ⏳ WAIT timing            → moderately demoted
+      - 🟡 CAUTION timing         → lightly demoted
+    Raw score is preserved for display; only sorting is affected.
+    """
+    s = item['score']
+    is_golden = item['sma50'] > item['sma200']
+    tv = item['timing_verdict']
+
+    if not is_golden:
+        s -= 40
+    elif tv == "⏳ WAIT":
+        s -= 15
+    elif tv == "🟡 CAUTION":
+        s -= 5
+
+    return s
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -514,26 +692,28 @@ def pe_flag(pe):
     if pe > 200: return " ⚠️ Extreme"
     return ""
 
-def evaluate_holding_signal(buy_price, current_price, rsi):
-    if buy_price <= 0:
-        return ("❌ ERROR", "Invalid buy price in purchase_log.json")
-    if pd.isna(rsi):
-        return ("❌ ERROR", "RSI unavailable; cannot produce sell verdict")
+def evaluate_accumulation_signal(current_price, week52_high, div_yield):
+    """
+    Long-term savings approach: no sell signals.
+    Tells you whether to add more savings to this position this month.
+    """
+    pullback = ((week52_high - current_price) / week52_high * 100) if week52_high > 0 else 0
 
-    gain_pct = ((current_price - buy_price) / buy_price) * 100
-    take_profit_price = buy_price * 1.15
-    trim_price = buy_price * 1.10
-    cut_loss_price = buy_price * 0.92
+    if pullback >= 15:
+        return ("🛒 ADD MORE", f"Price {pullback:.1f}% below 52-week high — great accumulation point")
+    elif pullback >= 8:
+        return ("💰 CONSIDER ADDING", f"Price {pullback:.1f}% below peak — decent entry for extra savings")
+    elif pullback <= 3:
+        return ("✅ HOLD & COLLECT", f"Near 52-week high ({pullback:.1f}% below) — sit tight, collect dividends")
+    else:
+        return ("✅ HOLD", f"Fair price zone ({pullback:.1f}% below 52-week high) — hold for income")
 
-    if current_price <= cut_loss_price:
-        return ("🛑 CUT LOSS", f"Price is at/below 8% stop ({cut_loss_price:.3f})")
-    if current_price >= take_profit_price and rsi > 70:
-        return ("🔴 TAKE PROFIT", f"Gain {gain_pct:.1f}% and RSI {rsi:.1f} > 70")
-    if current_price >= trim_price and 65 <= rsi <= 70:
-        return ("🟡 TRIM", f"Gain {gain_pct:.1f}% with RSI {rsi:.1f} in 65–70 zone")
-    if rsi > 70 and current_price < trim_price:
-        return ("🟠 WATCH", f"RSI {rsi:.1f} is overbought; gain not yet 10%")
-    return ("✅ HOLD", f"Trend condition healthy for now (RSI {rsi:.1f})")
+
+def project_annual_dividend(open_units, div_yield_pct, current_price):
+    """Estimate annual dividend income from a position based on current yield."""
+    annual_per_share = (div_yield_pct / 100) * current_price
+    annual_total = annual_per_share * open_units
+    return annual_total, annual_total / 12
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -543,13 +723,17 @@ def main():
     if not config:
         return
 
-    tickers_cfg  = config.get('tickers', [])
-    period       = config.get('period', '2y')
+    tickers_cfg       = config.get('tickers', [])
+    period            = config.get('period', '2y')
     ticker_sector_map = build_ticker_sector_map(tickers_cfg)
-    purchase_log = load_purchase_log()
-    sell_log     = load_sell_log()
-    last_sector  = get_last_sector(purchase_log, ticker_sector_map)
-    results      = []
+    purchase_log      = load_purchase_log()
+    sell_log          = load_sell_log()
+    last_sector       = get_last_sector(purchase_log, ticker_sector_map)
+    recent_sectors    = get_recent_sectors(purchase_log, ticker_sector_map, n=3)
+    results           = []
+
+    # Cache fetched data to avoid double API calls for holdings that are also on watchlist
+    fetched_cache = {}
 
     print(f"\n🚀 SAVINGS SCOUT — fetching {len(tickers_cfg)} stocks...\n")
 
@@ -559,9 +743,11 @@ def main():
 
         (name, div_yield, currency, pe_ratio, roe,
          revenue, profit_margin, div_years, div_growing,
-         ticker_obj, info) = get_stock_info(ticker)
+         ticker_obj, info, debt_to_equity) = get_stock_info(ticker)
 
         df = fetch_data(ticker, period)
+        fetched_cache[ticker] = (df, div_yield, name)
+
         if df.empty:
             print()
             continue
@@ -572,33 +758,40 @@ def main():
             continue
 
         t_green, t_yellow, t_verdict = get_timing_signals(ticker_obj, info, df)
+        months_since = get_months_since_last_buy(purchase_log, ticker)
+        debt_str, is_high_debt = debt_flag(sector, debt_to_equity)
 
         stats.update({
-            'ticker':         ticker,
-            'sector':         sector,
-            'name':           name,
-            'currency':       currency,
-            'div_yield':      div_yield,
-            'pe_ratio':       pe_ratio,
-            'roe':            roe,
-            'revenue':        revenue,
-            'profit_margin':  profit_margin,
-            'div_years':      div_years,
-            'div_growing':    div_growing,
-            'smart_lots':     calculate_min_lots(stats['price'], ticker),
-            'timing_green':   t_green,
-            'timing_yellow':  t_yellow,
-            'timing_verdict': t_verdict,
+            'ticker':           ticker,
+            'sector':           sector,
+            'name':             name,
+            'currency':         currency,
+            'div_yield':        div_yield,
+            'pe_ratio':         pe_ratio,
+            'roe':              roe,
+            'revenue':          revenue,
+            'profit_margin':    profit_margin,
+            'div_years':        div_years,
+            'div_growing':      div_growing,
+            'debt_to_equity':   debt_to_equity,
+            'debt_str':         debt_str,
+            'is_high_debt':     is_high_debt,
+            'smart_lots':       calculate_min_lots(stats['price'], ticker),
+            'timing_green':     t_green,
+            'timing_yellow':    t_yellow,
+            'timing_verdict':   t_verdict,
+            'months_since_buy': months_since,
         })
 
-        score, breakdown = calculate_savings_score(stats, sector, last_sector)
+        score, breakdown = calculate_savings_score(stats, sector, recent_sectors, months_since)
         stats['score']     = score
         stats['breakdown'] = breakdown
         results.append(stats)
         print()
         time.sleep(0.5)
 
-    results.sort(key=lambda x: x['score'], reverse=True)
+    # Sort by effective (actionability-adjusted) score, but keep raw score for display
+    results.sort(key=effective_score, reverse=True)
 
     # ── REPORT ───────────────────────────────────────────────────────────────
     W = 80
@@ -606,11 +799,11 @@ def main():
     print("🏆  SAVINGS SCOUT — MONTHLY PICK REPORT")
     print("=" * W)
 
-    if last_sector:
-        print(f"\n📌 Last purchase sector : {last_sector.upper()}")
+    if recent_sectors:
+        print(f"\n📌 Recent sectors purchased : {' → '.join(s.upper() for s in recent_sectors)}")
     if purchase_log:
-        last = purchase_log[-1]
-        print(f"   Last stock bought    : {last.get('ticker')} @ "
+        last = max(purchase_log, key=lambda e: e.get('month', ''))
+        print(f"   Last stock bought        : {last.get('ticker')} @ "
               f"{last.get('currency','RM')} {last.get('price','?')} ({last.get('month','?')})")
     print()
 
@@ -624,16 +817,21 @@ def main():
         score    = item['score']
         bd       = item['breakdown']
         pullback = (item['week52_high'] - price) / item['week52_high'] * 100 if item['week52_high'] > 0 else 0
+        eff_s    = effective_score(item)
+        is_golden = sma50 > sma200
+        tv        = item['timing_verdict']
 
         if rank in medals:
             print("─" * W)
-            print(f"  {medals[rank]}  (Score: {score}/100)")
+            actionable = is_golden and tv != "⏳ WAIT"
+            tag = "" if actionable else "  ⚠️  NOT ACTIONABLE THIS MONTH"
+            print(f"  {medals[rank]}  (Score: {score}  |  Effective: {eff_s}){tag}")
         elif rank == 3:
             print("─" * W)
             print("  📋  FULL WATCHLIST")
 
-        filled = round(score / 5)
-        bar    = "█" * filled + "░" * (20 - filled)
+        bar_fill = max(0, min(20, round(score / 6)))   # max ~117 → 20 bars
+        bar      = "█" * bar_fill + "░" * (20 - bar_fill)
 
         if   item['div_years'] >= 5: div_str = f"✅ {item['div_years']} yrs"
         elif item['div_years'] >= 1: div_str = f"⚠️  {item['div_years']} yr(s) only"
@@ -643,22 +841,29 @@ def main():
 
         roe_display = f"{item['roe']:.2f}%" if item['roe'] > 0 else "N/A (missing)"
 
-        print(f"\n  {item['name']} ({item['ticker']})  [{item['sector'].upper()}]")
-        print(f"  [{bar}] {score}/100")
+        months_tag = ""
+        if item['months_since_buy'] is not None:
+            months_tag = f"  |  Last bought: {item['months_since_buy']}m ago"
+        else:
+            months_tag = "  |  Never bought"
+
+        print(f"\n  {item['name']} ({item['ticker']})  [{item['sector'].upper()}]{months_tag}")
+        print(f"  [{bar}] Score: {score}  (effective {eff_s})")
         print(f"  Price:    {curr} {price:.3f}  |  52w High: {curr} {item['week52_high']:.3f}  |  Pullback: {pullback:.1f}%")
         print(f"  Yield:    {item['div_yield']:.2f}%  |  RSI: {item['rsi']:.1f} (info only)  |  Vol: {'🔥 HIGH' if item['volume_strong'] else 'Normal'}")
         print(f"  PE:       {item['pe_ratio']:.2f}{pe_flag(item['pe_ratio'])}  |  ROE: {roe_display}  |  Margin: {item['profit_margin']:.2f}%")
         print(f"  Revenue:  {item['revenue']} (TTM)  |  Sector PE bands: "
               f"Great <{SECTOR_PE_THRESHOLDS.get(item['sector'],{}).get('great','?')}  "
               f"OK <{SECTOR_PE_THRESHOLDS.get(item['sector'],{}).get('ok','?')}")
+        print(f"  Debt:     {item['debt_str']}")
         print(f"  Trend:    {trend_label(sma50, sma200, price)}")
         print(f"            SMA50: {sma50:.3f}  |  SMA200: {sma200:.3f}")
         print(f"  Dividend: {div_str}")
         print(f"  Score:    Trend={bd['trend']} | Entry={bd['entry']} | PE={bd['valuation']} | "
-              f"Yield={bd['yield']} | ROE={bd['roe']} | Div={bd['dividend']} | Rotation={bd['rotation']}")
+              f"Yield={bd['yield']} | ROE={bd['roe']} | Div={bd['dividend']} | "
+              f"Rotation={bd['rotation']} | Fresh={bd['freshness']}")
 
         # ── TIMING BLOCK ─────────────────────────────────────────────────────
-        tv = item['timing_verdict']
         print(f"  ┌─ TIMING: {tv} " + "─" * max(0, 56 - len(tv)))
         for g in item['timing_green']:
             print(f"  │  ✔ {g}")
@@ -667,8 +872,7 @@ def main():
         if not item['timing_green'] and not item['timing_yellow']:
             print(f"  │  (No timing data available)")
 
-        is_golden = sma50 > sma200
-        lots      = item['smart_lots']
+        lots = item['smart_lots']
 
         if not is_golden:
             print(f"  └─ ⛔ SKIP: Death cross — wait for trend reversal first")
@@ -689,15 +893,19 @@ def main():
     # ── SECTOR SUMMARY ───────────────────────────────────────────────────────
     print("─" * W)
     print("📊  YOUR WATCHLIST BY SECTOR")
-    from collections import Counter
     sector_map = Counter(r['sector'] for r in results)
     for sec, count in sorted(sector_map.items()):
-        flag = "  ← bought last month" if sec == last_sector else ""
-        print(f"   {sec.upper():15}  {count} stock(s){flag}")
+        flags = []
+        if sec == last_sector:
+            flags.append("← bought last month")
+        if recent_sectors.count(sec) >= 2:
+            flags.append("⚠️ heavy recent concentration")
+        flag_str = "  " + " | ".join(flags) if flags else ""
+        print(f"   {sec.upper():15}  {count} stock(s){flag_str}")
 
-    # ── HOLDINGS REVIEW (SELL SIGNALS) ───────────────────────────────────────
+    # ── HOLDINGS REVIEW (DIVIDEND INCOME & ACCUMULATION) ─────────────────────
     print("\n" + "─" * W)
-    print("📈  HOLDINGS REVIEW — SELL SIGNALS")
+    print("📊  HOLDINGS — DIVIDEND INCOME & ACCUMULATION")
     open_positions, realized_by_ticker, txn_errors = build_open_positions(
         purchase_log, sell_log, ticker_sector_map
     )
@@ -709,47 +917,61 @@ def main():
     if not purchase_log:
         print("   No holdings in purchase_log.json")
     elif not sell_log:
-        print("   ℹ️ sell_log.json not found or empty: treating all buys as open positions")
+        print("   ℹ️ sell_log.json not found or empty — treating all buys as open positions")
 
     if not open_positions:
         if purchase_log:
             print("   No open positions after reconciling buys/sells")
     else:
+        total_annual_div   = 0.0
+        portfolio_currency = "RM"
         for pos in open_positions:
-            ticker = pos['ticker']
-            buy_price = pos['avg_buy_price']
-            curr = pos['currency']
-            open_lots = pos['open_lots']
+            ticker     = pos['ticker']
+            buy_price  = pos['avg_buy_price']
+            curr       = pos['currency']
+            open_lots  = pos['open_lots']
             open_units = pos['open_units']
-            month = pos['first_month']
-            (stock_name, _, _, _, _, _, _, _, _, _, _) = get_stock_info(ticker)
+            month      = pos['first_month']
+            portfolio_currency = curr
 
-            df_h = fetch_data(ticker, period)
+            # Reuse cached data if we already fetched this ticker in the main loop
+            if ticker in fetched_cache:
+                df_h, div_yield_h, stock_name = fetched_cache[ticker]
+            else:
+                stock_name, div_yield_h, *_ = get_stock_info(ticker)
+                df_h = fetch_data(ticker, period)
+
             if df_h.empty:
-                print(f"   ❌ {ticker}: No market data, cannot evaluate sell signal")
+                print(f"   ❌ {ticker}: No market data available")
                 continue
 
             stats_h = analyze_stock(df_h)
             if not stats_h:
-                print(f"   ❌ {ticker}: Not enough data to calculate RSI/SMA")
+                print(f"   ❌ {ticker}: Not enough data")
                 continue
 
-            current_price = stats_h['price']
-            rsi = stats_h['rsi']
-            pnl_pct = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else float('nan')
-            pnl_per_share = current_price - buy_price
-            unrealized_total = pnl_per_share * open_units
-            realized_total = pos['realized_pnl']['value']
+            current_price    = stats_h['price']
+            week52_high      = stats_h['week52_high']
+            pnl_pct          = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else float('nan')
+            unrealized_total = (current_price - buy_price) * open_units
+            realized_total   = pos['realized_pnl']['value']
 
-            verdict, reason = evaluate_holding_signal(buy_price, current_price, rsi)
+            annual_div, monthly_div = project_annual_dividend(open_units, div_yield_h, current_price)
+            total_annual_div += annual_div
+            verdict, reason = evaluate_accumulation_signal(current_price, week52_high, div_yield_h)
             sign = "+" if pnl_pct >= 0 else ""
 
-            print(f"\n   {stock_name} ({ticker}) (first open lot from {month})")
-            print(f"   Open: {open_lots} lot(s) / {open_units} unit(s)")
-            print(f"   Avg Buy: {curr} {buy_price:.3f} | Now: {curr} {current_price:.3f} | RSI: {rsi:.1f}")
-            print(f"   Unrealized P/L: {sign}{pnl_pct:.2f}% ({curr} {pnl_per_share:+.3f}/unit, total {curr} {unrealized_total:+.2f})")
-            print(f"   Realized P/L: {curr} {realized_total:+.2f}")
-            print(f"   Verdict: {verdict} — {reason}")
+            print(f"\n   {stock_name} ({ticker})  [{pos.get('sector', '').upper()}]  (since {month})")
+            print(f"   Holding:  {open_lots} lot(s) / {open_units} units")
+            print(f"   Avg Buy:  {curr} {buy_price:.3f}  |  Now: {curr} {current_price:.3f}  |  P/L: {sign}{pnl_pct:.2f}%")
+            print(f"   Capital:  Unrealized {curr} {unrealized_total:+.2f}  |  Realized {curr} {realized_total:+.2f}")
+            print(f"   Dividend: {div_yield_h:.2f}% yield  →  {curr} {annual_div:.2f}/yr  (~{curr} {monthly_div:.2f}/mth)")
+            print(f"   Verdict:  {verdict} — {reason}")
+
+        print(f"\n   {'─' * 60}")
+        print(f"   💰 ESTIMATED ANNUAL DIVIDEND INCOME : {portfolio_currency} {total_annual_div:.2f}")
+        print(f"      Monthly average                  : {portfolio_currency} {total_annual_div / 12:.2f}")
+        print(f"      Reinvest dividends to compound your savings over time!")
 
     closed_realized = [
         (ticker, data['value'], data['currency'])
@@ -757,7 +979,7 @@ def main():
         if ticker not in {p['ticker'] for p in open_positions}
     ]
     if closed_realized:
-        print("\n   Closed positions (already fully sold):")
+        print("\n   Rebalanced / closed positions:")
         for ticker, value, currency in closed_realized:
             print(f"   - {ticker}: Realized P/L {currency} {value:+.2f}")
 
@@ -765,8 +987,12 @@ def main():
     print("\n" + "─" * W)
     print("📝  TO LOG THIS MONTH'S PURCHASE")
     print("   Copy the line below into purchase_log.json (inside the [ ] array):\n")
-    if results:
-        top  = results[0]
+
+    # Suggest the first actionable stock (golden cross + not WAIT)
+    actionable = [r for r in results if r['sma50'] > r['sma200'] and r['timing_verdict'] != "⏳ WAIT"]
+    top = actionable[0] if actionable else (results[0] if results else None)
+
+    if top:
         lots = top['smart_lots']
         log_entry = {
             "month":    datetime.now().strftime("%Y-%m"),
@@ -776,6 +1002,8 @@ def main():
             "lots":     lots['lots'] if lots else 1,
         }
         print(f"   {json.dumps(log_entry)}")
+        if top != results[0]:
+            print(f"   (Note: {results[0]['ticker']} ranks highest on fundamentals but is not actionable this month)")
 
     print("\n✅ Done. Run again next payday.\n")
 
