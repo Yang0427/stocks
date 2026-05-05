@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile main.py)",
+      "PowerShell(\\(Get-Content \"c:\\\\Users\\\\tingy\\\\brrbrrpatapim\\\\stocks\\\\stocks.json\" -Raw\\) -replace '\"5248\\\\.KL\", \"sector\": \"general\"', '\"5248.KL\", \"sector\": \"consumer\"' -replace '\"5296\\\\.KL\", \"sector\": \"general\"', '\"5296.KL\", \"sector\": \"consumer\"' | Set-Content \"c:\\\\Users\\\\tingy\\\\brrbrrpatapim\\\\stocks\\\\stocks.json\" -Encoding utf8)"
     ]
   }
 }

@@ -1,4 +1,4 @@
-{
+﻿{
   "period": "2y",
   "tickers": [
     { "ticker": "1155.KL", "sector": "bank"      },
@@ -17,7 +17,7 @@
     { "ticker": "6033.KL", "sector": "energy"    },
     { "ticker": "6947.KL", "sector": "telco"     },
     { "ticker": "4863.KL", "sector": "telco"     },
-    { "ticker": "5248.KL", "sector": "general"   },
-    { "ticker": "5296.KL", "sector": "general"   }
+    { "ticker": "5248.KL", "sector": "consumer"   },
+    { "ticker": "5296.KL", "sector": "consumer"   }
   ]
 }

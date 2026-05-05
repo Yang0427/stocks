@@ -18,14 +18,19 @@ SECTOR_PE_THRESHOLDS = {
     'utilities': {'great': 18, 'ok': 25},
     'energy':    {'great': 15, 'ok': 22},
     'general':   {'great': 15, 'ok': 20},
+    'consumer':  {'great': 18, 'ok': 25},
 }
+
+# Cyclical sectors where trailing yield is unreliable — yield score is capped
+# and "falling knife" pullback detection applies (fix #5 and fix #4 scope).
+CYCLICAL_SECTORS = {'consumer', 'energy', 'general'}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG & PURCHASE LOG
 # ─────────────────────────────────────────────────────────────────────────────
 def load_config():
     try:
-        with open('stocks.json', 'r') as f:
+        with open('stocks.json', 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except FileNotFoundError:
         print("❌ Error: 'stocks.json' not found.")
@@ -33,14 +38,14 @@ def load_config():
 
 def load_purchase_log():
     try:
-        with open('purchase_log.json', 'r') as f:
+        with open('purchase_log.json', 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except FileNotFoundError:
         return []
 
 def load_sell_log():
     try:
-        with open('sell_log.json', 'r') as f:
+        with open('sell_log.json', 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except FileNotFoundError:
         return []
@@ -286,7 +291,7 @@ def check_dividend_consistency(ticker_obj):
         return 0, False
 
 def get_stock_info(ticker):
-    """Fetches name, yield, currency, fundamentals, dividend history, and debt ratio."""
+    """Fetches name, yield, currency, fundamentals, dividend history, debt ratio, and earnings health."""
     try:
         t = yf.Ticker(ticker)
         info = t.info
@@ -321,6 +326,37 @@ def get_stock_info(ticker):
         # Debt-to-equity ratio (reported as %, so 150 = 1.5x)
         debt_to_equity = info.get('debtToEquity') or 0.0
 
+        # ── Earnings health signals ──────────────────────────────────────────
+        trailing_pe = info.get('trailingPE') or 0.0
+        forward_pe  = info.get('forwardPE')  or 0.0
+        trailing_eps = info.get('trailingEps') or 0.0
+        forward_eps  = info.get('forwardEps')  or 0.0
+        earnings_growth_qoq = info.get('earningsQuarterlyGrowth') or None  # latest Q vs same Q last yr
+        earnings_growth_ttm = info.get('earningsGrowth')           or None  # TTM YoY
+        revenue_growth      = info.get('revenueGrowth')            or None  # TTM YoY
+        payout_ratio        = info.get('payoutRatio')              or None  # 0–1 float
+
+        # Multi-quarter earnings trend — last 4 quarters of YoY growth
+        # Uses quarterly income_stmt (Net Income row) — avoids deprecated Ticker.earnings
+        quarterly_neg_count = 0
+        try:
+            qi = t.quarterly_income_stmt
+            if qi is not None and not qi.empty:
+                ni_row = None
+                for label in ('Net Income', 'NetIncome', 'Net Income Common Stockholders'):
+                    if label in qi.index:
+                        ni_row = qi.loc[label]
+                        break
+                if ni_row is not None:
+                    vals = ni_row.dropna().values  # newest quarter first
+                    neg_count = 0
+                    for i in range(min(4, len(vals) - 4)):
+                        if vals[i] < vals[i + 4]:
+                            neg_count += 1
+                    quarterly_neg_count = neg_count
+        except Exception:
+            pass
+
         def fmt(v):
             if v >= 1e9: return f"{v/1e9:.2f}B"
             if v >= 1e6: return f"{v/1e6:.2f}M"
@@ -328,12 +364,40 @@ def get_stock_info(ticker):
 
         div_years, div_growing = check_dividend_consistency(t)
 
+        earnings_health = {
+            'trailing_pe':          float(trailing_pe),
+            'forward_pe':           float(forward_pe),
+            'trailing_eps':         float(trailing_eps),
+            'forward_eps':          float(forward_eps),
+            'earnings_growth_qoq':  earnings_growth_qoq,
+            'earnings_growth_ttm':  earnings_growth_ttm,
+            'revenue_growth':       revenue_growth,
+            'payout_ratio':         payout_ratio,
+            'quarterly_neg_count':  quarterly_neg_count,
+        }
+
+        # ── Analyst consensus ────────────────────────────────────────────────
+        target_mean_price  = info.get('targetMeanPrice')  or 0.0
+        target_high_price  = info.get('targetHighPrice')  or 0.0
+        target_low_price   = info.get('targetLowPrice')   or 0.0
+        recommendation_key = info.get('recommendationKey') or ''   # 'buy','hold','sell' etc.
+        num_analysts       = info.get('numberOfAnalystOpinions') or 0
+
+        analyst_data = {
+            'target_mean':      float(target_mean_price),
+            'target_high':      float(target_high_price),
+            'target_low':       float(target_low_price),
+            'recommendation':   recommendation_key.lower(),
+            'num_analysts':     int(num_analysts),
+            'current_price':    float(current_price),
+        }
+
         return (name, yield_pct, currency, float(pe_ratio), roe,
                 fmt(revenue), profit_margin, div_years, div_growing,
-                t, info, debt_to_equity)
+                t, info, debt_to_equity, earnings_health, analyst_data)
 
     except Exception:
-        return (ticker, 0.0, "N/A", 0.0, 0.0, "N/A", 0.0, 0, False, None, {}, 0.0)
+        return (ticker, 0.0, "N/A", 0.0, 0.0, "N/A", 0.0, 0, False, None, {}, 0.0, {}, {})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMING SIGNALS  (short-term only — intentionally separate from score)
@@ -526,6 +590,188 @@ def debt_flag(sector, debt_to_equity):
             return f"✅ D/E {ratio:.1f}x — low debt", False
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EARNINGS HEALTH  — detects deteriorating fundamentals the score engine misses
+# ─────────────────────────────────────────────────────────────────────────────
+def get_earnings_health_signals(earnings_health, sector='general'):
+    """
+    Returns (warnings: list[str], score_penalty: int, health_label: str).
+
+    Five checks:
+      A. Multi-quarter trend  — how many of last 4 quarters were YoY negative
+      B. Latest quarter & TTM — single-quarter and full-year direction
+      C. EPS revision direction — forward EPS vs trailing EPS (fix #2)
+      D. Dividend sustainability — payout ratio, with tighter thresholds for cyclicals
+      E. Forward vs trailing PE — but only penalise when EPS is also being revised down
+    """
+    warnings = []
+    penalty  = 0
+    is_cyclical = sector in CYCLICAL_SECTORS
+
+    eq   = earnings_health.get('earnings_growth_qoq')    # float or None
+    et   = earnings_health.get('earnings_growth_ttm')    # float or None
+    rv   = earnings_health.get('revenue_growth')         # float or None
+    pr   = earnings_health.get('payout_ratio')           # float 0-1 or None
+    tpe  = earnings_health.get('trailing_pe',  0.0)
+    fpe  = earnings_health.get('forward_pe',   0.0)
+    teps = earnings_health.get('trailing_eps', 0.0)
+    feps = earnings_health.get('forward_eps',  0.0)
+    qneg = earnings_health.get('quarterly_neg_count', 0)  # 0-4 quarters negative YoY
+
+    # ── A. Multi-quarter trend (fix #3) ─────────────────────────────────────
+    # 2+ of last 4 quarters negative YoY = structural decline, not a blip
+    if qneg >= 3:
+        warnings.append(f"🔴 {qneg}/4 recent quarters below prior-year — sustained earnings decline")
+        penalty += 20
+    elif qneg == 2:
+        warnings.append(f"🟠 {qneg}/4 recent quarters below prior-year — pattern of weakness")
+        penalty += 10
+    elif qneg == 1:
+        warnings.append(f"🟡 1/4 recent quarters below prior-year — monitor next result")
+        penalty += 3
+
+    # ── B. Latest quarter & TTM ──────────────────────────────────────────────
+    if eq is not None:
+        pct = eq * 100
+        if eq <= -0.40:
+            warnings.append(f"🔴 Latest quarter earnings {pct:+.0f}% YoY — severe collapse")
+            penalty += 25
+        elif eq <= -0.20:
+            warnings.append(f"🟠 Latest quarter earnings {pct:+.0f}% YoY — significant decline")
+            penalty += 15
+        elif eq <= -0.05:
+            warnings.append(f"🟡 Latest quarter earnings {pct:+.0f}% YoY — softening")
+            penalty += 5
+        elif eq >= 0.15:
+            # For cyclicals: a single good quarter after a collapse is a bounce, not a recovery.
+            # Only give the reward if the multi-quarter trend is also clean (qneg == 0).
+            if not is_cyclical or qneg == 0:
+                warnings.append(f"🟢 Latest quarter earnings {pct:+.0f}% YoY — strong growth")
+                penalty -= 5
+            else:
+                warnings.append(
+                    f"🟡 Latest quarter earnings {pct:+.0f}% YoY — bounce after weakness "
+                    f"({qneg} of last 4 quarters still below prior-year)"
+                )
+
+    if et is not None:
+        pct = et * 100
+        if et <= -0.30 and (eq is None or eq > -0.20):
+            warnings.append(f"🟠 TTM earnings growth {pct:+.0f}% — full-year trend declining")
+            penalty += 10
+        elif et >= 0.10 and eq is None:
+            warnings.append(f"🟢 TTM earnings growth {pct:+.0f}% — improving fundamentals")
+            penalty -= 3
+
+    if rv is not None:
+        pct = rv * 100
+        if rv <= -0.15:
+            warnings.append(f"🟠 Revenue shrinking {pct:+.0f}% YoY — top-line under pressure")
+            penalty += 8
+        elif rv >= 0.10:
+            warnings.append(f"🟢 Revenue growing {pct:+.0f}% YoY — business expanding")
+            penalty -= 3
+
+    # ── C. EPS revision direction (fix #2) ──────────────────────────────────
+    # Forward EPS < trailing EPS means analysts are cutting estimates.
+    # This catches downward EPS revision cycles even when forward PE looks "cheap".
+    if teps > 0 and feps > 0:
+        eps_change = (feps - teps) / abs(teps)
+        if eps_change <= -0.20:
+            warnings.append(
+                f"🔴 Forward EPS {feps:.3f} vs Trailing {teps:.3f} "
+                f"— analysts cut estimates {abs(eps_change)*100:.0f}%, earnings declining"
+            )
+            penalty += 18
+        elif eps_change <= -0.08:
+            warnings.append(
+                f"🟠 Forward EPS {feps:.3f} vs Trailing {teps:.3f} "
+                f"— mild downward revision, earnings under pressure"
+            )
+            penalty += 8
+        elif eps_change >= 0.10:
+            warnings.append(
+                f"🟢 Forward EPS {feps:.3f} vs Trailing {teps:.3f} "
+                f"— analysts raising estimates, earnings momentum positive"
+            )
+            penalty -= 5
+
+    # ── D. Dividend sustainability (fix #5 — tighter for cyclicals) ─────────
+    if pr is not None and pr > 0:
+        # Cyclical sectors get tighter thresholds: 60%/75%/90% instead of 75%/90%/100%
+        t1 = 0.60 if is_cyclical else 0.75
+        t2 = 0.75 if is_cyclical else 0.90
+        t3 = 0.90 if is_cyclical else 1.00
+
+        if pr > t3:
+            warnings.append(
+                f"🔴 Payout ratio {pr*100:.0f}% — dividend exceeds safe limit"
+                + (" for cyclical sector" if is_cyclical else ", paid from reserves")
+            )
+            penalty += 20
+        elif pr > t2:
+            warnings.append(
+                f"🟠 Payout ratio {pr*100:.0f}% — nearly all earnings consumed, cut risk high"
+            )
+            penalty += 12
+        elif pr > t1:
+            warnings.append(
+                f"🟡 Payout ratio {pr*100:.0f}% — stretched"
+                + (" (tighter limit for cyclical sector)" if is_cyclical else ", limited buffer")
+            )
+            penalty += 5
+        else:
+            warnings.append(f"🟢 Payout ratio {pr*100:.0f}% — dividend well covered by earnings")
+
+    # ── E. Forward vs trailing PE — only penalise when EPS also revised down ─
+    # This prevents "fake good news" when fPE < tPE is caused by the stock
+    # price falling (not by earnings growing). (fix #2 companion)
+    if tpe > 0 and fpe > 0:
+        pe_expansion = (fpe - tpe) / tpe
+        eps_declining = (teps > 0 and feps > 0 and feps < teps)
+
+        if pe_expansion >= 0.25:
+            warnings.append(
+                f"🔴 Forward PE {fpe:.1f}x vs Trailing {tpe:.1f}x "
+                f"— analysts pricing in earnings decline"
+            )
+            penalty += 15
+        elif pe_expansion >= 0.10:
+            warnings.append(
+                f"🟡 Forward PE {fpe:.1f}x vs Trailing {tpe:.1f}x "
+                f"— mild earnings headwind expected"
+            )
+            penalty += 5
+        elif pe_expansion <= -0.15:
+            if eps_declining:
+                # fPE looks better only because stock price dropped — not genuine growth
+                warnings.append(
+                    f"🟡 Forward PE {fpe:.1f}x vs Trailing {tpe:.1f}x "
+                    f"— looks cheaper but EPS estimates were cut, not earnings growth"
+                )
+                penalty += 5
+            else:
+                warnings.append(
+                    f"🟢 Forward PE {fpe:.1f}x vs Trailing {tpe:.1f}x "
+                    f"— analysts expect {abs(pe_expansion)*100:.0f}% earnings growth"
+                )
+                penalty -= 5
+
+    # ── Health label ─────────────────────────────────────────────────────────
+    if penalty >= 35:
+        label = "🔴 DETERIORATING"
+    elif penalty >= 15:
+        label = "🟠 WEAKENING"
+    elif penalty >= 5:
+        label = "🟡 MIXED"
+    elif penalty <= -5:
+        label = "🟢 IMPROVING"
+    else:
+        label = "🟢 STABLE"
+
+    return warnings, max(penalty, 0), label
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FEE CALCULATOR (BURSA / MALAYSIA ONLY)
 # ─────────────────────────────────────────────────────────────────────────────
 def calculate_min_lots(price_per_unit, ticker):
@@ -556,14 +802,21 @@ def analyze_stock(df):
     df['Vol_Avg'] = df['Volume'].rolling(window=20).mean()
     latest   = df.iloc[-1]
     lookback = min(252, len(df))
+    high_window = df['High'].iloc[-lookback:]
+    high_idx    = high_window.idxmax()
+    now_ts      = pd.Timestamp.now(tz=high_idx.tz if high_idx.tz else None)
+    months_since_high = (
+        (now_ts.year - high_idx.year) * 12 + (now_ts.month - high_idx.month)
+    )
     return {
-        'price':         float(latest['Close']),
-        'rsi':           float(latest['RSI']),
-        'sma50':         float(latest['SMA_50']),
-        'sma200':        float(latest['SMA_200']),
-        'volume_strong': float(latest['Volume']) > float(latest['Vol_Avg']) * 1.5,
-        'week52_high':   float(df['High'].iloc[-lookback:].max()),
-        'week52_low':    float(df['Low'].iloc[-lookback:].min()),
+        'price':              float(latest['Close']),
+        'rsi':                float(latest['RSI']),
+        'sma50':              float(latest['SMA_50']),
+        'sma200':             float(latest['SMA_200']),
+        'volume_strong':      float(latest['Volume']) > float(latest['Vol_Avg']) * 1.5,
+        'week52_high':        float(high_window.max()),
+        'week52_low':         float(df['Low'].iloc[-lookback:].min()),
+        'months_since_high':  months_since_high,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -579,11 +832,14 @@ def calculate_savings_score(stock_data, sector, recent_sectors, months_since_las
     week52_high = stock_data.get('week52_high', price)
     div_years   = stock_data.get('div_years', 0)
     div_growing = stock_data.get('div_growing', False)
+    eh_penalty  = stock_data.get('eh_penalty', 0)
 
     score = 0
     bd    = {}
 
-    rsi = stock_data.get('rsi', 50)
+    rsi              = stock_data.get('rsi', 50)
+    months_since_high = stock_data.get('months_since_high', 0)
+    is_cyclical       = sector in CYCLICAL_SECTORS
 
     # ── Trend (15 pts) ───────────────────────────────────────────────────────
     trend_pts   = 15 if sma50 > sma200 else 0
@@ -591,35 +847,35 @@ def calculate_savings_score(stock_data, sector, recent_sectors, months_since_las
     bd['trend'] = trend_pts
 
     # ── Entry / Pullback (max 30 pts, min -10 pts penalty) ──────────────────
-    # This is the most important factor for a savings investor:
-    # buying near the peak locks in downside risk before dividends can recover it.
-    #
-    # Scoring bands:
-    #   ≥ 20% pullback  → 30 pts  (deep value zone)
-    #   15–20%          → 25 pts
-    #   10–15%          → 20 pts
-    #   5–10%           → 12 pts
-    #   3–5%            → 6 pts
-    #   < 3%            → -10 pts (near 52-week high — penalty, not just zero)
-    #
-    # RSI adjustment: overbought RSI (≥65) cuts entry pts by a further 5
-    # because momentum is stretched and a pullback is statistically likely.
+    # Fix #4: if the 52-week high was set 9+ months ago AND the sector is
+    # cyclical AND price is below SMA200, treat as a structural downtrend
+    # (falling knife) and cap entry points at 12 regardless of pullback depth.
     pullback = ((week52_high - price) / week52_high * 100) if week52_high > 0 else 0
+    falling_knife = (
+        is_cyclical
+        and months_since_high >= 9
+        and price < sma200
+    )
+
+    # Tweak #3: widen gap between decent and deep pullbacks to reward real value entries
     if pullback >= 20:
         entry_pts = 30
     elif pullback >= 15:
-        entry_pts = 25
+        entry_pts = 28
     elif pullback >= 10:
-        entry_pts = 20
+        entry_pts = 22
     elif pullback >= 5:
-        entry_pts = 12
+        entry_pts = 10
     elif pullback >= 3:
         entry_pts = 6
     else:
-        entry_pts = -10  # buying at/near peak — meaningful penalty
+        entry_pts = -10
+
+    if falling_knife:
+        entry_pts = min(entry_pts, 12)   # cap — deep pullback on a downtrend is not a bargain
 
     if rsi >= 65 and entry_pts > 0:
-        entry_pts -= 5   # overbought momentum compounds peak-entry risk
+        entry_pts -= 5
 
     score      += entry_pts
     bd['entry'] = entry_pts
@@ -630,7 +886,10 @@ def calculate_savings_score(stock_data, sector, recent_sectors, months_since_las
     score          += val_pts
     bd['valuation'] = val_pts
 
-    # ── Yield (max 20 pts — tiered so higher yield scores better) ───────────
+    # ── Yield (max 20 pts for defensive, max 12 pts for cyclicals) ───────────
+    # Fix #1 & #5: cyclical sector yields are unreliable (paid from reserves
+    # during earnings downturns). Cap their yield score so a 7%+ trailing
+    # yield on an auto distributor doesn't outscore a 6% bank yield.
     if div_yield >= 8:
         yield_pts = 20
     elif div_yield >= 6:
@@ -641,13 +900,56 @@ def calculate_savings_score(stock_data, sector, recent_sectors, months_since_las
         yield_pts = 7
     else:
         yield_pts = round(min(div_yield * 2, 6))
-    score      += yield_pts
-    bd['yield'] = yield_pts
+
+    if is_cyclical:
+        yield_pts = min(yield_pts, 12)   # hard cap for cyclicals
+
+    # Tweak #2: yield trap penalty — high yield near peak is a trap, not a gift.
+    # A 6%+ yield with <8% pullback means you're paying near-peak for income.
+    yield_trap = 0
+    if div_yield >= 6 and pullback < 8:
+        yield_trap  = -5
+        yield_pts   = max(0, yield_pts + yield_trap)
+
+    score              += yield_pts
+    bd['yield']         = yield_pts
+    bd['yield_trap']    = yield_trap
 
     # ── ROE (10 pts) ─────────────────────────────────────────────────────────
     roe_pts   = 10 if roe > 12 else 5 if roe > 8 else 2 if roe > 0 else 0
     score     += roe_pts
     bd['roe'] = roe_pts
+
+    # ── Analyst consensus bonus (max 10 pts) — tweak #1 ─────────────────────
+    # Rewards stocks where a meaningful number of analysts see real upside.
+    # Only fires when ≥5 analysts cover the stock, to avoid noise.
+    analyst_data  = stock_data.get('analyst_data', {})
+    target_mean   = analyst_data.get('target_mean', 0.0)
+    curr_price_a  = analyst_data.get('current_price', price)
+    rec_key       = analyst_data.get('recommendation', '')
+    n_analysts    = analyst_data.get('num_analysts', 0)
+
+    analyst_pts = 0
+    if n_analysts >= 5 and target_mean > 0 and curr_price_a > 0:
+        upside = (target_mean - curr_price_a) / curr_price_a
+        if upside >= 0.20:
+            analyst_pts = 10
+        elif upside >= 0.12:
+            analyst_pts = 7
+        elif upside >= 0.06:
+            analyst_pts = 4
+        elif upside < 0:
+            analyst_pts = -5   # analysts see downside — penalise
+
+    # Boost if strong buy consensus, trim if hold/sell
+    if analyst_pts > 0:
+        if rec_key in ('strong_buy', 'buy'):
+            analyst_pts = min(analyst_pts + 2, 10)
+        elif rec_key in ('underperform', 'sell', 'strong_sell'):
+            analyst_pts = max(analyst_pts - 4, 0)
+
+    score             += analyst_pts
+    bd['analyst']      = analyst_pts
 
     # ── Dividend history (15 pts) ────────────────────────────────────────────
     div_pts = 15 if div_years >= 5 else 10 if div_years >= 3 else 5 if div_years >= 1 else 0
@@ -680,6 +982,20 @@ def calculate_savings_score(stock_data, sector, recent_sectors, months_since_las
         fresh_pts = 0    # bought very recently
     score           += fresh_pts
     bd['freshness']  = fresh_pts
+
+    # ── Recent-buy penalty (fix #6) — don't double-down within 2 months ───────
+    # Even if freshness=0, a stock bought last month can still rank #1 on raw
+    # fundamentals. This hard-demotes it so the script actively diversifies.
+    if months_since_last_buy is not None and months_since_last_buy < 2:
+        recent_buy_pen   = 20
+        score           -= recent_buy_pen
+        bd['recent_buy'] = -recent_buy_pen
+    else:
+        bd['recent_buy'] = 0
+
+    # ── Earnings health penalty — deduct for deteriorating fundamentals ───────
+    score              -= eh_penalty
+    bd['eh_penalty']    = -eh_penalty   # negative so it reads as a deduction in breakdown
 
     return round(score), bd
 
@@ -776,7 +1092,7 @@ def main():
 
         (name, div_yield, currency, pe_ratio, roe,
          revenue, profit_margin, div_years, div_growing,
-         ticker_obj, info, debt_to_equity) = get_stock_info(ticker)
+         ticker_obj, info, debt_to_equity, earnings_health, analyst_data) = get_stock_info(ticker)
 
         df = fetch_data(ticker, period)
         fetched_cache[ticker] = (df, div_yield, name)
@@ -793,6 +1109,7 @@ def main():
         t_green, t_yellow, t_verdict = get_timing_signals(ticker_obj, info, df)
         months_since = get_months_since_last_buy(purchase_log, ticker)
         debt_str, is_high_debt = debt_flag(sector, debt_to_equity)
+        eh_warnings, eh_penalty, eh_label = get_earnings_health_signals(earnings_health, sector)
 
         stats.update({
             'ticker':           ticker,
@@ -814,6 +1131,11 @@ def main():
             'timing_yellow':    t_yellow,
             'timing_verdict':   t_verdict,
             'months_since_buy': months_since,
+            'eh_warnings':      eh_warnings,
+            'eh_penalty':       eh_penalty,
+            'eh_label':         eh_label,
+            'months_since_high': stats.get('months_since_high', 0),
+            'analyst_data':     analyst_data,
         })
 
         score, breakdown = calculate_savings_score(stats, sector, recent_sectors, months_since)
@@ -892,9 +1214,49 @@ def main():
         print(f"  Trend:    {trend_label(sma50, sma200, price)}")
         print(f"            SMA50: {sma50:.3f}  |  SMA200: {sma200:.3f}")
         print(f"  Dividend: {div_str}")
-        print(f"  Score:    Trend={bd['trend']} | Entry={bd['entry']} | PE={bd['valuation']} | "
-              f"Yield={bd['yield']} | ROE={bd['roe']} | Div={bd['dividend']} | "
-              f"Rotation={bd['rotation']} | Fresh={bd['freshness']}")
+        # ── Analyst line ──────────────────────────────────────────────────────
+        ad           = item.get('analyst_data', {})
+        tgt          = ad.get('target_mean', 0.0)
+        tgt_hi       = ad.get('target_high', 0.0)
+        n_an         = ad.get('num_analysts', 0)
+        rec          = ad.get('recommendation', '')
+        curr_price_a = ad.get('current_price', price)
+        if tgt > 0 and curr_price_a > 0:
+            upside_pct   = (tgt - curr_price_a) / curr_price_a * 100
+            rec_str      = rec.replace('_', ' ').upper() if rec else 'N/A'
+            analyst_line = (
+                f"  Analysts: {n_an} analysts  |  Target {curr} {tgt:.3f}"
+                f"  ({upside_pct:+.1f}%)  |  High {curr} {tgt_hi:.3f}"
+                f"  |  Consensus: {rec_str}"
+            )
+        else:
+            analyst_line = "  Analysts: No coverage data"
+        print(analyst_line)
+
+        falling_knife_tag = ""
+        if (sector in CYCLICAL_SECTORS
+                and item.get('months_since_high', 0) >= 9
+                and price < item['sma200']):
+            falling_knife_tag = "  ⚠️ FALLING KNIFE"
+        print(f"  Score:    Trend={bd['trend']} | Entry={bd['entry']}{falling_knife_tag} | "
+              f"PE={bd['valuation']} | Yield={bd['yield']}(trap={bd.get('yield_trap',0)}) | "
+              f"ROE={bd['roe']} | Div={bd['dividend']} | Rotation={bd['rotation']} | "
+              f"Fresh={bd['freshness']} | Analyst={bd.get('analyst',0)} | "
+              f"RecentBuy={bd.get('recent_buy', 0)} | EarningsHealth={bd.get('eh_penalty', 0)}")
+
+        # ── EARNINGS HEALTH BLOCK ─────────────────────────────────────────────
+        eh_label = item.get('eh_label', '🟢 STABLE')
+        eh_warn  = item.get('eh_warnings', [])
+        print(f"  ┌─ EARNINGS HEALTH: {eh_label} " + "─" * max(0, 46 - len(eh_label)))
+        if eh_warn:
+            for w in eh_warn:
+                print(f"  │  {w}")
+        else:
+            print(f"  │  (No earnings trend data available)")
+        if item.get('eh_penalty', 0) > 0:
+            print(f"  └─ ⚠️  Score penalised -{item['eh_penalty']} pts for fundamental deterioration")
+        else:
+            print(f"  └─ Fundamentals look clean")
 
         # ── TIMING BLOCK ─────────────────────────────────────────────────────
         print(f"  ┌─ TIMING: {tv} " + "─" * max(0, 56 - len(tv)))
@@ -1021,8 +1383,15 @@ def main():
     print("📝  TO LOG THIS MONTH'S PURCHASE")
     print("   Copy the line below into purchase_log.json (inside the [ ] array):\n")
 
-    # Suggest the first actionable stock (golden cross + not WAIT)
-    actionable = [r for r in results if r['sma50'] > r['sma200'] and r['timing_verdict'] != "⏳ WAIT"]
+    # Suggest the first fully actionable stock:
+    # golden cross + not WAIT + healthy earnings + not bought within 2 months
+    actionable = [
+        r for r in results
+        if r['sma50'] > r['sma200']
+        and r['timing_verdict'] != "⏳ WAIT"
+        and r.get('eh_label', '') not in ('🔴 DETERIORATING',)
+        and (r.get('months_since_buy') is None or r['months_since_buy'] >= 2)
+    ]
     top = actionable[0] if actionable else (results[0] if results else None)
 
     if top:
@@ -1036,7 +1405,46 @@ def main():
         }
         print(f"   {json.dumps(log_entry)}")
         if top != results[0]:
-            print(f"   (Note: {results[0]['ticker']} ranks highest on fundamentals but is not actionable this month)")
+            print(f"   (Note: {results[0]['ticker']} ranks highest on score but skipped — "
+                  f"earnings health: {results[0].get('eh_label','?')})")
+
+    # ── FINAL VERDICT ────────────────────────────────────────────────────────
+    print("\n" + "=" * W)
+    print("🎯  THIS MONTH'S BEST BUY — FINAL VERDICT")
+    print("=" * W)
+    if top:
+        curr  = top['currency']
+        lots  = top['smart_lots']
+        tv    = top['timing_verdict']
+        score = top['score']
+        eff   = effective_score(top)
+        eh    = top.get('eh_label', '🟢 STABLE')
+        pr    = top.get('eh_warnings', [])
+
+        print(f"\n  ✅ {top['name']} ({top['ticker']})  [{top['sector'].upper()}]")
+        print(f"     Score {score}  |  Effective {eff}  |  Earnings: {eh}")
+        print(f"     Price {curr} {top['price']:.3f}  |  Yield {top['div_yield']:.2f}%  |  PE {top['pe_ratio']:.2f}")
+        print(f"     Timing: {tv}")
+
+        if lots:
+            if tv == "🟡 CAUTION":
+                half      = max(1, lots['lots'] // 2)
+                half_cost = half * 100 * top['price']
+                print(f"\n  👉 BUY {half} lot(s) now → {curr} {half_cost:.2f}  (half position, caution flag active)")
+            else:
+                print(f"\n  👉 BUY {lots['lots']} lot(s) → {curr} {lots['cost']:.2f}  (fee: {lots['fee_pct']:.2f}%)")
+        else:
+            print(f"\n  👉 BUY 1 unit → {curr} {top['price']:.3f}")
+
+        # Warn if this pick still has yellow earnings signals
+        eh_yellow = [w for w in pr if w.startswith('🟡') or w.startswith('🟠')]
+        if eh_yellow:
+            print(f"\n  ⚠️  Watch points:")
+            for w in eh_yellow:
+                print(f"     {w}")
+    else:
+        print("\n  ❌ No fully actionable picks this month — all either death cross, ⏳ WAIT, or deteriorating earnings.")
+        print("     Consider waiting or parking savings in a money market fund.")
 
     print("\n✅ Done. Run again next payday.\n")
 
