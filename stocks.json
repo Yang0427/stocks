@@ -17,7 +17,12 @@
     { "ticker": "6033.KL", "sector": "energy"    },
     { "ticker": "6947.KL", "sector": "telco"     },
     { "ticker": "4863.KL", "sector": "telco"     },
-    { "ticker": "5248.KL", "sector": "consumer"   },
-    { "ticker": "5296.KL", "sector": "consumer"   }
+    { "ticker": "5248.KL", "sector": "consumer"        },
+    { "ticker": "0166.KL", "sector": "tech"            },
+    { "ticker": "5005.KL", "sector": "tech"            },
+    { "ticker": "5296.KL", "sector": "consumer"        },
+    { "ticker": "5326.KL", "sector": "consumer"        },
+    { "ticker": "4707.KL", "sector": "consumer_staples"},
+    { "ticker": "5681.KL", "sector": "energy"          }
   ]
 }

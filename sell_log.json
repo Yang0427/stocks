@@ -1,4 +1,5 @@
 [
+    {"month": "2026-05", "ticker": "5296.KL", "price": 1.70, "currency": "RM", "lots": 3},
     {"month": "2026-03", "ticker": "4677.KL", "price": 1.90, "currency": "RM", "lots": 2},
     {"month": "2026-02", "ticker": "5248.KL", "price": 0.875, "currency": "RM", "lots": 2}
 ]

@@ -19,11 +19,14 @@ SECTOR_PE_THRESHOLDS = {
     'energy':    {'great': 15, 'ok': 22},
     'general':   {'great': 15, 'ok': 20},
     'consumer':  {'great': 18, 'ok': 25},
+    'tech':             {'great': 20, 'ok': 30},
+    'healthcare':       {'great': 22, 'ok': 32},
+    'consumer_staples': {'great': 22, 'ok': 30},
 }
 
 # Cyclical sectors where trailing yield is unreliable — yield score is capped
 # and "falling knife" pullback detection applies (fix #5 and fix #4 scope).
-CYCLICAL_SECTORS = {'consumer', 'energy', 'general'}
+CYCLICAL_SECTORS = {'consumer', 'energy', 'general', 'tech'}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG & PURCHASE LOG
@@ -364,16 +367,25 @@ def get_stock_info(ticker):
 
         div_years, div_growing = check_dividend_consistency(t)
 
+        # Historical PE estimate — approximate 5-year average PE using
+        # PEG ratio if available (PEG = PE / EPS_growth_rate), otherwise
+        # fall back to a sector-typical multiple stored alongside current PE.
+        # Most reliable yfinance proxy: use 5-year avg dividend yield vs current
+        # as a rough reversion signal (both available in info directly).
+        five_yr_avg_div_yield = info.get('fiveYearAvgDividendYield') or 0.0
+        # five_yr_avg_div_yield is in % already (e.g. 5.2 means 5.2%)
+
         earnings_health = {
-            'trailing_pe':          float(trailing_pe),
-            'forward_pe':           float(forward_pe),
-            'trailing_eps':         float(trailing_eps),
-            'forward_eps':          float(forward_eps),
-            'earnings_growth_qoq':  earnings_growth_qoq,
-            'earnings_growth_ttm':  earnings_growth_ttm,
-            'revenue_growth':       revenue_growth,
-            'payout_ratio':         payout_ratio,
-            'quarterly_neg_count':  quarterly_neg_count,
+            'trailing_pe':            float(trailing_pe),
+            'forward_pe':             float(forward_pe),
+            'trailing_eps':           float(trailing_eps),
+            'forward_eps':            float(forward_eps),
+            'earnings_growth_qoq':    earnings_growth_qoq,
+            'earnings_growth_ttm':    earnings_growth_ttm,
+            'revenue_growth':         revenue_growth,
+            'payout_ratio':           payout_ratio,
+            'quarterly_neg_count':    quarterly_neg_count,
+            'five_yr_avg_div_yield':  float(five_yr_avg_div_yield),
         }
 
         # ── Analyst consensus ────────────────────────────────────────────────
@@ -951,6 +963,45 @@ def calculate_savings_score(stock_data, sector, recent_sectors, months_since_las
     score             += analyst_pts
     bd['analyst']      = analyst_pts
 
+    # ── EPS growth rate (max 10 pts) — forward vs trailing EPS ─────────────
+    # Separate from income score: rewards genuine earnings acceleration.
+    # Tech sector gets up to 10 pts here; other sectors capped at 6 pts.
+    earnings_health_data = stock_data.get('earnings_health', {})
+    feps_g = earnings_health_data.get('forward_eps', 0.0)
+    teps_g = earnings_health_data.get('trailing_eps', 0.0)
+    is_tech = (sector == 'tech')
+
+    growth_pts = 0
+    if teps_g > 0 and feps_g > 0:
+        eps_growth_rate = (feps_g - teps_g) / abs(teps_g)
+        if eps_growth_rate >= 0.20:
+            growth_pts = 10 if is_tech else 6
+        elif eps_growth_rate >= 0.10:
+            growth_pts = 7 if is_tech else 4
+        elif eps_growth_rate >= 0.05:
+            growth_pts = 4 if is_tech else 2
+        elif eps_growth_rate <= -0.10:
+            growth_pts = -3   # modest penalty for EPS shrinkage
+    score            += growth_pts
+    bd['eps_growth']  = growth_pts
+
+    # ── Historical yield mean-reversion bonus (max 8 pts) ───────────────────
+    # If today's yield is materially above the stock's own 5-year average yield,
+    # the stock is cheap relative to its own history — re-rating upside exists.
+    # Only fires when five_yr_avg_div_yield is known and yield > 0.
+    five_yr_avg_dy = earnings_health_data.get('five_yr_avg_div_yield', 0.0)
+    rerate_pts = 0
+    if five_yr_avg_dy > 0 and div_yield > 0:
+        yield_premium = (div_yield - five_yr_avg_dy) / five_yr_avg_dy
+        if yield_premium >= 0.30:
+            rerate_pts = 8   # yield 30%+ above own history — significantly undervalued vs history
+        elif yield_premium >= 0.15:
+            rerate_pts = 4   # yield 15–29% above own average — mild undervaluation
+        elif yield_premium <= -0.20:
+            rerate_pts = -3  # yield below own average by 20%+ — priced richly vs history
+    score             += rerate_pts
+    bd['rerate']       = rerate_pts
+
     # ── Dividend history (15 pts) ────────────────────────────────────────────
     div_pts = 15 if div_years >= 5 else 10 if div_years >= 3 else 5 if div_years >= 1 else 0
     if div_growing and div_pts > 0:
@@ -1136,6 +1187,7 @@ def main():
             'eh_label':         eh_label,
             'months_since_high': stats.get('months_since_high', 0),
             'analyst_data':     analyst_data,
+            'earnings_health':  earnings_health,
         })
 
         score, breakdown = calculate_savings_score(stats, sector, recent_sectors, months_since)
@@ -1242,17 +1294,42 @@ def main():
               f"PE={bd['valuation']} | Yield={bd['yield']}(trap={bd.get('yield_trap',0)}) | "
               f"ROE={bd['roe']} | Div={bd['dividend']} | Rotation={bd['rotation']} | "
               f"Fresh={bd['freshness']} | Analyst={bd.get('analyst',0)} | "
+              f"EPSGrowth={bd.get('eps_growth',0)} | Rerate={bd.get('rerate',0)} | "
               f"RecentBuy={bd.get('recent_buy', 0)} | EarningsHealth={bd.get('eh_penalty', 0)}")
 
         # ── EARNINGS HEALTH BLOCK ─────────────────────────────────────────────
         eh_label = item.get('eh_label', '🟢 STABLE')
         eh_warn  = item.get('eh_warnings', [])
+        eh_data  = item.get('earnings_health', {})
         print(f"  ┌─ EARNINGS HEALTH: {eh_label} " + "─" * max(0, 46 - len(eh_label)))
         if eh_warn:
             for w in eh_warn:
                 print(f"  │  {w}")
         else:
             print(f"  │  (No earnings trend data available)")
+        # EPS growth signal
+        feps_d = eh_data.get('forward_eps', 0.0)
+        teps_d = eh_data.get('trailing_eps', 0.0)
+        if teps_d > 0 and feps_d > 0:
+            eps_gr = (feps_d - teps_d) / abs(teps_d) * 100
+            eps_icon = "🟢" if eps_gr >= 5 else ("🟡" if eps_gr >= 0 else "🔴")
+            print(f"  │  {eps_icon} EPS growth (fwd vs trailing): {eps_gr:+.1f}%  "
+                  f"(Trailing EPS {teps_d:.3f}  →  Forward EPS {feps_d:.3f})")
+        # Historical yield mean-reversion signal
+        five_dy = eh_data.get('five_yr_avg_div_yield', 0.0)
+        curr_dy = item.get('div_yield', 0.0)
+        if five_dy > 0 and curr_dy > 0:
+            prem = (curr_dy - five_dy) / five_dy * 100
+            if prem >= 15:
+                rerate_icon = "🟢"
+                rerate_msg  = f"yield {prem:+.0f}% above 5-yr avg — historically cheap"
+            elif prem <= -15:
+                rerate_icon = "🔴"
+                rerate_msg  = f"yield {prem:+.0f}% below 5-yr avg — priced richly vs own history"
+            else:
+                rerate_icon = "🟡"
+                rerate_msg  = f"yield near 5-yr average ({five_dy:.2f}%) — fairly valued vs history"
+            print(f"  │  {rerate_icon} Historical yield: now {curr_dy:.2f}%  |  5-yr avg {five_dy:.2f}%  — {rerate_msg}")
         if item.get('eh_penalty', 0) > 0:
             print(f"  └─ ⚠️  Score penalised -{item['eh_penalty']} pts for fundamental deterioration")
         else:
