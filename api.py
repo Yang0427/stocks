@@ -217,6 +217,15 @@ def holdings():
     enriched = []
     total_annual_div = 0.0
     portfolio_currency = "RM"
+
+    # Portfolio-wide running totals
+    total_cost = 0.0           # what you paid for the still-open units
+    total_value = 0.0          # what those units are worth now
+    total_unrealized = 0.0     # value - cost
+    total_realized = 0.0       # locked-in P/L from sells
+    best = None                # biggest % gainer
+    worst = None               # biggest % loser
+
     for pos in positions:
         ticker = pos["ticker"]
         buy_price = pos["avg_buy_price"]
@@ -239,22 +248,43 @@ def holdings():
             week52_high = stats["week52_high"]
 
         pnl_pct = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else None
-        unrealized = (current_price - buy_price) * open_units
+        cost = buy_price * open_units
+        value = current_price * open_units
+        unrealized = value - cost
+        realized = pos["realized_pnl"]["value"]
         annual_div, monthly_div = engine.project_annual_dividend(open_units, div_yield, current_price)
-        total_annual_div += annual_div
         verdict, reason = engine.evaluate_accumulation_signal(current_price, week52_high, div_yield)
+
+        total_cost += cost
+        total_value += value
+        total_unrealized += unrealized
+        total_realized += realized
+        total_annual_div += annual_div
+
+        if pnl_pct is not None:
+            if best is None or pnl_pct > best["pnl_pct"]:
+                best = {"ticker": ticker, "pnl_pct": round(pnl_pct, 2)}
+            if worst is None or pnl_pct < worst["pnl_pct"]:
+                worst = {"ticker": ticker, "pnl_pct": round(pnl_pct, 2)}
 
         enriched.append({
             "ticker": ticker, "name": name, "sector": pos.get("sector", ""),
             "currency": pos["currency"], "open_lots": pos["open_lots"], "open_units": open_units,
             "avg_buy_price": round(buy_price, 4), "current_price": round(current_price, 4),
             "pnl_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+            "cost": round(cost, 2), "value": round(value, 2),
             "unrealized": round(unrealized, 2),
-            "realized": round(pos["realized_pnl"]["value"], 2),
+            "realized": round(realized, 2),
             "div_yield": round(div_yield, 2),
             "annual_div": round(annual_div, 2), "monthly_div": round(monthly_div, 2),
             "verdict": verdict, "reason": reason, "since": pos["first_month"],
         })
+
+    # Total return blends unrealized + realized against money put in.
+    total_pl = total_unrealized + total_realized
+    total_return_pct = (total_unrealized / total_cost * 100) if total_cost > 0 else None
+    winners = sum(1 for p in enriched if p["pnl_pct"] is not None and p["pnl_pct"] > 0)
+    losers = sum(1 for p in enriched if p["pnl_pct"] is not None and p["pnl_pct"] < 0)
 
     return {
         "positions": enriched,
@@ -262,6 +292,19 @@ def holdings():
         "total_annual_div": round(total_annual_div, 2),
         "monthly_avg_div": round(total_annual_div / 12, 2),
         "currency": portfolio_currency,
+        "summary": {
+            "total_cost": round(total_cost, 2),
+            "total_value": round(total_value, 2),
+            "total_unrealized": round(total_unrealized, 2),
+            "total_realized": round(total_realized, 2),
+            "total_pl": round(total_pl, 2),
+            "total_return_pct": round(total_return_pct, 2) if total_return_pct is not None else None,
+            "winners": winners,
+            "losers": losers,
+            "positions": len(enriched),
+            "best": best,
+            "worst": worst,
+        },
     }
 
 
