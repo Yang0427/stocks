@@ -15,7 +15,6 @@ Thumbs.db
 
 # Engine price cache (regenerated on demand)
 .cache/
-miscellaneous/
 
 # Frontend
 frontend/node_modules/
