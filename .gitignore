@@ -12,3 +12,11 @@ env/
 # OS System Files
 .DS_Store
 Thumbs.db
+
+# Engine price cache (regenerated on demand)
+.cache/
+miscellaneous/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
