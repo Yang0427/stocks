@@ -7,6 +7,13 @@
       "lots": 1
    },
    {
+      "month": "2026-05",
+      "ticker": "1023.KL",
+      "price": 7.35,
+      "currency": "RM",
+      "lots": 1
+   },
+   {
       "month": "2026-06",
       "ticker": "5176.KL",
       "price": 2.2643,

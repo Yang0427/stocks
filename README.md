@@ -14,6 +14,7 @@ dividend payers, bought when they're on sale.
 | `engine.py` | **The brain.** All scoring, data fetching, P/L reconciliation, budget-fit and caching. Single source of truth. |
 | `main.py` | CLI front-end. Prints the full monthly report to the terminal. Imports `engine.py`. |
 | `api.py` | FastAPI backend. Exposes `engine.py` over HTTP and serves the web app. |
+| `run.py` | Starts the backend and frontend dev servers together (`python3 run.py`). |
 | `frontend/` | Vite + React + Tailwind web app (the appealing interface). |
 | `stocks.json` | Your watchlist (ticker + sector). |
 | `purchase_log.json` / `sell_log.json` | Your transaction history (drives sector-rotation, freshness, P/L). |
@@ -38,12 +39,12 @@ automatically drops to the best pick you can actually afford.
 
 Prerequisites: **Python 3.11+** and **Node 18+**.
 
-```powershell
+```bash
 # 1. install python deps (once)
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 
 # 2. start everything
-powershell -ExecutionPolicy Bypass -File run.ps1
+python3 run.py
 ```
 
 Then open **http://localhost:5173**.
@@ -58,9 +59,9 @@ Then open **http://localhost:5173**.
 
 ### Manual start (two terminals)
 
-```powershell
+```bash
 # terminal 1 — backend
-python -m uvicorn api:app --reload --port 8000
+python3 -m uvicorn api:app --reload --port 8000
 
 # terminal 2 — frontend
 cd frontend
@@ -70,19 +71,19 @@ npm run dev
 
 ### Production build (single process)
 
-```powershell
+```bash
 cd frontend
 npm run build          # outputs frontend/dist
 cd ..
-python -m uvicorn api:app --port 8000
+python3 -m uvicorn api:app --port 8000
 ```
 
 FastAPI then serves the built React app at **http://localhost:8000** directly.
 
 ## Run the CLI (terminal report)
 
-```powershell
-python main.py
+```bash
+python3 main.py
 ```
 
 Prints the full ranked report, holdings review, dividend income, and the final "best buy" verdict.
