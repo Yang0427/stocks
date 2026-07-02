@@ -30,12 +30,17 @@ import ta
 # ─────────────────────────────────────────────────────────────────────────────
 SECTOR_PE_THRESHOLDS = {
     'bank':      {'great': 10, 'ok': 14},
+    'exchange':  {'great': 18, 'ok': 25},
     'reit':      {'great': 14, 'ok': 18},
     'telco':     {'great': 18, 'ok': 25},
     'utilities': {'great': 18, 'ok': 25},
     'energy':    {'great': 15, 'ok': 22},
     'general':   {'great': 15, 'ok': 20},
     'consumer':  {'great': 18, 'ok': 25},
+    'materials':        {'great': 18, 'ok': 26},
+    'chemicals':        {'great': 16, 'ok': 24},
+    'property':         {'great': 12, 'ok': 18},
+    'industrial':       {'great': 16, 'ok': 24},
     'tech':             {'great': 20, 'ok': 30},
     'healthcare':       {'great': 22, 'ok': 32},
     'consumer_staples': {'great': 22, 'ok': 30},
@@ -43,10 +48,11 @@ SECTOR_PE_THRESHOLDS = {
 
 # Cyclical sectors where trailing yield is unreliable — yield score is capped
 # and "falling knife" pullback detection applies.
-CYCLICAL_SECTORS = {'consumer', 'energy', 'general', 'tech'}
+CYCLICAL_SECTORS = {'consumer', 'energy', 'general', 'tech', 'materials', 'chemicals', 'property'}
 
 # Max theoretical raw score, used to normalise the score bar in any UI.
 MAX_SCORE = 117
+MAX_LONG_TERM_SCORE = 100
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache')
 DEFAULT_CACHE_TTL_HOURS = 6
@@ -186,11 +192,18 @@ _YFINANCE_SECTOR_MAP = {
     'financial services': 'bank',
     'financials':         'bank',
     'banking':            'bank',
+    'capital markets':    'exchange',
+    'exchange':           'exchange',
     'real estate':        'reit',
     'communication services': 'telco',
     'telecommunications': 'telco',
     'utilities':          'utilities',
     'energy':             'energy',
+    'basic materials':    'materials',
+    'materials':          'materials',
+    'chemicals':          'chemicals',
+    'property':           'property',
+    'industrials':        'industrial',
 }
 
 
@@ -397,6 +410,25 @@ def _cache_age_hours(path):
     return age_s / 3600.0
 
 
+def _clean_price_history(df):
+    """Drop unusable OHLC rows so bad quote ticks cannot poison the engine."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
+    required = [c for c in ('Open', 'High', 'Low', 'Close') if c in out.columns]
+    if not required:
+        return pd.DataFrame()
+    for col in required + (['Volume'] if 'Volume' in out.columns else []):
+        out[col] = pd.to_numeric(out[col], errors='coerce')
+    out = out.replace([float('inf'), float('-inf')], pd.NA)
+    out = out.dropna(subset=required)
+    for col in required:
+        out = out[out[col] > 0]
+    return out
+
+
 def _read_cached_history(ticker, period, ttl_hours):
     """Return a cached price DataFrame if fresh enough, else None."""
     path = _cache_path(ticker, period)
@@ -411,7 +443,7 @@ def _read_cached_history(ticker, period, ttl_hours):
             return df
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.set_index('Date')
-        return df
+        return _clean_price_history(df)
     except Exception:
         return None
 
@@ -419,9 +451,9 @@ def _read_cached_history(ticker, period, ttl_hours):
 def _write_cached_history(ticker, period, df):
     os.makedirs(CACHE_DIR, exist_ok=True)
     try:
-        out = df.copy()
-        if isinstance(out.columns, pd.MultiIndex):
-            out.columns = out.columns.get_level_values(0)
+        out = _clean_price_history(df)
+        if out.empty:
+            return
         out = out.reset_index()
         # Normalise the date column name yfinance may emit as 'Date' or 'index'
         date_col = 'Date' if 'Date' in out.columns else out.columns[0]
@@ -434,7 +466,7 @@ def _write_cached_history(ticker, period, df):
             'data': out.to_dict(orient='records'),
         }
         with open(_cache_path(ticker, period), 'w', encoding='utf-8') as f:
-            json.dump(payload, f)
+            json.dump(payload, f, allow_nan=False)
     except Exception:
         pass  # caching is best-effort; never break analysis over a write failure
 
@@ -455,6 +487,7 @@ def fetch_data(ticker, period='2y', use_cache=True, ttl_hours=DEFAULT_CACHE_TTL_
         if log:
             log(f"{ticker}: fetching...")
         df = yf.download(ticker, period=period, interval='1d', progress=False)
+        df = _clean_price_history(df)
         if df is not None and not df.empty:
             _write_cached_history(ticker, period, df)
         return df if df is not None else pd.DataFrame()
@@ -506,7 +539,7 @@ def get_stock_info(ticker):
         else:                        currency = "USD"
 
         div_rate = info.get('dividendRate', 0)
-        current_price = info.get('currentPrice', 0) or info.get('previousClose', 0)
+        current_price = info.get('currentPrice', 0) or info.get('regularMarketPrice', 0) or info.get('previousClose', 0)
         if div_rate and current_price and current_price > 0:
             yield_pct = (div_rate / current_price) * 100
         else:
@@ -577,6 +610,17 @@ def get_stock_info(ticker):
         recommendation_key = info.get('recommendationKey') or ''
         num_analysts = info.get('numberOfAnalystOpinions') or 0
 
+        def info_float(*keys):
+            for key in keys:
+                val = info.get(key)
+                try:
+                    val = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(val) and val > 0:
+                    return val
+            return 0.0
+
         analyst_data = {
             'target_mean':    float(target_mean_price),
             'target_high':    float(target_high_price),
@@ -584,6 +628,10 @@ def get_stock_info(ticker):
             'recommendation': recommendation_key.lower(),
             'num_analysts':   int(num_analysts),
             'current_price':  float(current_price),
+            'day_open':       info_float('open', 'regularMarketOpen'),
+            'day_high':       info_float('dayHigh', 'regularMarketDayHigh'),
+            'day_low':        info_float('dayLow', 'regularMarketDayLow'),
+            'previous_close':  info_float('previousClose', 'regularMarketPreviousClose'),
         }
 
         return (name, yield_pct, currency, float(pe_ratio), roe,
@@ -856,6 +904,8 @@ def get_earnings_health_signals(earnings_health, sector='general'):
 def calculate_min_lots(price_per_unit, ticker):
     if not ticker.endswith('.KL'):
         return None
+    if not math.isfinite(price_per_unit) or price_per_unit <= 0:
+        return None
     for lots in range(1, 100):
         total_value = price_per_unit * 100 * lots
         stamp_duty = max(math.ceil(total_value / 1000), 1)
@@ -870,16 +920,149 @@ def calculate_min_lots(price_per_unit, ticker):
 
 def bursa_fees(total_value):
     """Return total transaction fee (RM) for a Bursa trade of given value."""
+    if not math.isfinite(total_value) or total_value <= 0:
+        return 0.0
     stamp_duty = max(math.ceil(total_value / 1000), 1)
     clearing_fee = total_value * 0.0003
     platform_fee = 3.00
     return platform_fee + stamp_duty + clearing_fee
 
 
+def price_tick(ticker, price):
+    """Approximate board-lot tick size for limit-order suggestions."""
+    if not math.isfinite(price) or price <= 0:
+        return 0.01
+    if ticker.endswith('.KL'):
+        if price < 1:
+            return 0.005
+        if price < 10:
+            return 0.01
+        if price < 100:
+            return 0.02
+        return 0.10
+    return 0.01
+
+
+def round_to_tick(price, ticker, mode='nearest'):
+    """Round a price to a valid-looking tick. `mode` can be nearest/down/up."""
+    if not math.isfinite(price) or price <= 0:
+        return 0.0
+    tick = price_tick(ticker, price)
+    scaled = price / tick
+    if mode == 'down':
+        rounded = math.floor(scaled) * tick
+    elif mode == 'up':
+        rounded = math.ceil(scaled) * tick
+    else:
+        rounded = round(scaled) * tick
+    return round(max(0.0, rounded), 4)
+
+
+def limit_order_plan(item):
+    """Suggest a practical buy-limit ladder from the latest quote and day range.
+
+    This is an execution helper, not a prediction engine: it gives a reasonable
+    bid inside today's range so the user can avoid chasing a live quote at the
+    high of the session.
+    """
+    ticker = item.get('ticker', '')
+    curr = item.get('currency', '')
+    live = item.get('order_price', item.get('price', 0.0))
+    close = item.get('price', live)
+    if not math.isfinite(live) or live <= 0:
+        return None
+
+    day_low = item.get('day_low', 0.0)
+    day_high = item.get('day_high', 0.0)
+    day_open = item.get('day_open', 0.0)
+    prev_close = item.get('prev_close', close)
+
+    anchors = [v for v in (live, close, day_open, prev_close) if math.isfinite(v) and v > 0]
+    if not (math.isfinite(day_low) and day_low > 0):
+        day_low = min(anchors) if anchors else live
+    if not (math.isfinite(day_high) and day_high > 0):
+        day_high = max(anchors) if anchors else live
+    if day_high < day_low:
+        day_low, day_high = day_high, day_low
+
+    day_range = day_high - day_low
+    synthetic_range = max(live * 0.0125, price_tick(ticker, live) * 4)
+    if day_range <= 0:
+        day_low = max(price_tick(ticker, live), live - synthetic_range / 2)
+        day_high = live + synthetic_range / 2
+        day_range = day_high - day_low
+
+    position_in_range = (live - day_low) / day_range if day_range > 0 else 0.5
+    rsi = item.get('rsi', 50.0)
+
+    if position_in_range >= 0.67:
+        strategy = 'patient_pullback'
+        label = 'Patient pullback bid'
+        target_raw = live - (day_range * 0.30)
+        patient_raw = live - (day_range * 0.50)
+    elif rsi >= 65:
+        strategy = 'cool_off'
+        label = 'Let it cool off'
+        target_raw = live - (day_range * 0.25)
+        patient_raw = live - (day_range * 0.45)
+    elif position_in_range <= 0.33:
+        strategy = 'near_low'
+        label = 'Near day low'
+        target_raw = live
+        patient_raw = max(day_low, live - (day_range * 0.20))
+    else:
+        strategy = 'mid_range'
+        label = 'Mid-range limit'
+        target_raw = live - (day_range * 0.18)
+        patient_raw = live - (day_range * 0.38)
+
+    floor_price = max(price_tick(ticker, live), day_low)
+    suggested = round_to_tick(max(floor_price, min(live, target_raw)), ticker, 'nearest')
+    patient = round_to_tick(max(floor_price, min(suggested, patient_raw)), ticker, 'down')
+    max_entry = round_to_tick(live, ticker, 'up')
+
+    # Keep the main suggestion no higher than the live quote and no lower than
+    # the patient bid after tick rounding.
+    suggested = min(suggested, max_entry)
+    if suggested < patient:
+        suggested = patient
+
+    gap_pct = ((live - suggested) / live * 100) if live > 0 else 0.0
+    day_low_s = f"{curr} {day_low:.3f}" if curr else f"{day_low:.3f}"
+    day_high_s = f"{curr} {day_high:.3f}" if curr else f"{day_high:.3f}"
+    live_s = f"{curr} {live:.3f}" if curr else f"{live:.3f}"
+    suggested_s = f"{curr} {suggested:.3f}" if curr else f"{suggested:.3f}"
+
+    if suggested < live:
+        reason = (
+            f"Live quote {live_s} sits at {position_in_range * 100:.0f}% of today's "
+            f"{day_low_s}-{day_high_s} range, so bid around {suggested_s} instead of chasing."
+        )
+    else:
+        reason = (
+            f"Live quote {live_s} is already close to the lower part of today's "
+            f"{day_low_s}-{day_high_s} range."
+        )
+
+    return {
+        'strategy': strategy,
+        'label': label,
+        'suggested_limit_price': suggested,
+        'patient_limit_price': patient,
+        'max_entry_price': max_entry,
+        'day_low': round(day_low, 4),
+        'day_high': round(day_high, 4),
+        'day_open': round(day_open, 4) if math.isfinite(day_open) and day_open > 0 else None,
+        'gap_from_live_pct': round(gap_pct, 2),
+        'reason': reason,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TECHNICAL ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
 def analyze_stock(df):
+    df = _clean_price_history(df)
     if len(df) < 200:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -889,13 +1072,18 @@ def analyze_stock(df):
     df['SMA_200'] = ta.trend.sma_indicator(df['Close'], window=200)
     df['Vol_Avg'] = df['Volume'].rolling(window=20).mean()
     latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else latest
     lookback = min(252, len(df))
     high_window = df['High'].iloc[-lookback:]
     high_idx = high_window.idxmax()
     now_ts = pd.Timestamp.now(tz=high_idx.tz if high_idx.tz else None)
     months_since_high = (now_ts.year - high_idx.year) * 12 + (now_ts.month - high_idx.month)
-    return {
+    stats = {
         'price':             float(latest['Close']),
+        'day_open':          float(latest['Open']),
+        'day_high':          float(latest['High']),
+        'day_low':           float(latest['Low']),
+        'prev_close':        float(prev['Close']),
         'rsi':               float(latest['RSI']),
         'sma50':             float(latest['SMA_50']),
         'sma200':            float(latest['SMA_200']),
@@ -904,6 +1092,12 @@ def analyze_stock(df):
         'week52_low':        float(df['Low'].iloc[-lookback:].min()),
         'months_since_high': months_since_high,
     }
+    required = ('price', 'rsi', 'sma50', 'sma200', 'week52_high', 'week52_low')
+    if any(not math.isfinite(stats[k]) or stats[k] <= 0 for k in required if k != 'rsi'):
+        return None
+    if not math.isfinite(stats['rsi']):
+        stats['rsi'] = 50.0
+    return stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1088,6 +1282,224 @@ def calculate_savings_score(stock_data, sector, recent_sectors, months_since_las
     return round(score), bd
 
 
+def _points_from_roe(roe, sector):
+    if roe <= 0:
+        return 0
+    if sector == 'bank':
+        if roe >= 12: return 14
+        if roe >= 10: return 11
+        if roe >= 8:  return 8
+        if roe >= 5:  return 4
+        return 1
+    if roe >= 22: return 14
+    if roe >= 16: return 12
+    if roe >= 12: return 10
+    if roe >= 8:  return 6
+    if roe >= 4:  return 3
+    return 1
+
+
+def calculate_long_term_score(stock_data, sector, recent_sectors, months_since_last_buy):
+    """Rank for the default monthly pick: durable business first, entry second.
+
+    This intentionally differs from the legacy savings score. The old score is
+    useful for finding a technical/value setup; this one is for money intended
+    to sit for years, so weak quality can cap an otherwise cheap stock.
+    """
+    price = stock_data['price']
+    sma50 = stock_data['sma50']
+    sma200 = stock_data['sma200']
+    pe = stock_data.get('pe_ratio', 0)
+    roe = stock_data.get('roe', 0)
+    div_yield = stock_data.get('div_yield', 0)
+    week52_high = stock_data.get('week52_high', price)
+    profit_margin = stock_data.get('profit_margin', 0)
+    div_years = stock_data.get('div_years', 0)
+    div_growing = stock_data.get('div_growing', False)
+    earnings_health = stock_data.get('earnings_health', {})
+    eh_label = stock_data.get('eh_label', '')
+    analyst_data = stock_data.get('analyst_data', {})
+    pullback = ((week52_high - price) / week52_high * 100) if week52_high > 0 else 0
+    rsi = stock_data.get('rsi', 50)
+
+    bd = {}
+    flags = []
+
+    quality = _points_from_roe(roe, sector)
+    if sector != 'bank':
+        if profit_margin >= 20:
+            quality += 6
+        elif profit_margin >= 12:
+            quality += 4
+        elif profit_margin >= 6:
+            quality += 2
+
+    if eh_label == '🟢 IMPROVING':
+        quality += 8
+    elif eh_label == '🟢 STABLE':
+        quality += 6
+    elif eh_label == '🟡 MIXED':
+        quality += 2
+    elif eh_label == '🟠 WEAKENING':
+        quality -= 4
+    elif eh_label == '🔴 DETERIORATING':
+        quality -= 12
+
+    teps = earnings_health.get('trailing_eps', 0.0)
+    feps = earnings_health.get('forward_eps', 0.0)
+    if teps > 0 and feps > 0:
+        eps_growth = (feps - teps) / abs(teps)
+        if eps_growth >= 0.15:
+            quality += 5
+        elif eps_growth >= 0.05:
+            quality += 3
+        elif eps_growth <= -0.10:
+            quality -= 4
+
+    if div_years >= 5:
+        quality += 5
+    elif div_years >= 3:
+        quality += 3
+    elif div_years >= 1:
+        quality += 1
+    if div_growing and div_years >= 3:
+        quality += 2
+
+    if sector == 'bank' and 0 < roe < 6:
+        quality = min(quality, 18)
+        flags.append("Low bank ROE caps long-term conviction")
+
+    quality = max(0, min(40, quality))
+    bd['quality'] = round(quality)
+
+    thresh = SECTOR_PE_THRESHOLDS.get(sector, SECTOR_PE_THRESHOLDS['general'])
+    valuation = 0
+    if pe > 0 and pe <= 200:
+        if pe < thresh['great']:
+            valuation += 12
+        elif pe < thresh['ok']:
+            valuation += 8
+        elif pe < thresh['ok'] * 1.25:
+            valuation += 4
+        else:
+            valuation += 1
+
+    five_yr_avg_dy = earnings_health.get('five_yr_avg_div_yield', 0.0)
+    if five_yr_avg_dy > 0 and div_yield > 0:
+        yield_premium = (div_yield - five_yr_avg_dy) / five_yr_avg_dy
+        if yield_premium >= 0.30:
+            valuation += 6
+        elif yield_premium >= 0.15:
+            valuation += 3
+        elif yield_premium <= -0.20:
+            valuation -= 3
+
+    target_mean = analyst_data.get('target_mean', 0.0)
+    curr_price_a = analyst_data.get('current_price', price)
+    n_analysts = analyst_data.get('num_analysts', 0)
+    if n_analysts >= 5 and target_mean > 0 and curr_price_a > 0:
+        upside = (target_mean - curr_price_a) / curr_price_a
+        if upside >= 0.20:
+            valuation += 4
+        elif upside >= 0.10:
+            valuation += 2
+        elif upside < 0:
+            valuation -= 3
+
+    if sector == 'bank' and 0 < roe < 6:
+        valuation = min(valuation, 12)
+    if sector in {'materials', 'chemicals', 'energy'} and pe > thresh['ok'] and div_yield < 2:
+        valuation = min(valuation, 8)
+        flags.append("Cyclical low-yield stock needs a wider valuation margin")
+    valuation = max(0, min(25, valuation))
+    bd['valuation'] = round(valuation)
+
+    if pullback >= 20:
+        entry = 10
+    elif pullback >= 15:
+        entry = 9
+    elif pullback >= 10:
+        entry = 7
+    elif pullback >= 5:
+        entry = 5
+    elif pullback >= 3:
+        entry = 3
+    else:
+        entry = -2
+    if sma50 > sma200:
+        entry += 5
+    if price > sma200:
+        entry += 3
+    if rsi <= 35:
+        entry += 2
+    elif rsi >= 70:
+        entry -= 3
+    if sector in CYCLICAL_SECTORS and stock_data.get('months_since_high', 0) >= 9 and price < sma200:
+        entry = min(entry, 8)
+        flags.append("Cyclical falling-knife risk limits entry score")
+    if sector in {'materials', 'chemicals', 'energy'} and pe > thresh['ok'] and div_yield < 2:
+        entry = min(entry, 14)
+    entry = max(0, min(20, entry))
+    bd['entry'] = round(entry)
+
+    income = 0
+    if 4 <= div_yield <= 7:
+        income += 5
+    elif 2 <= div_yield < 4:
+        income += 3
+    elif div_yield > 7:
+        income += 3
+        flags.append("Very high yield needs manual sustainability check")
+    elif div_yield > 0:
+        income += 1
+    if div_years >= 5:
+        income += 4
+    elif div_years >= 3:
+        income += 3
+    elif div_years >= 1:
+        income += 1
+    if div_growing and div_years >= 3:
+        income += 1
+    income = max(0, min(10, income))
+    bd['income'] = round(income)
+
+    sector_count = recent_sectors.count(sector) if recent_sectors else 0
+    if not recent_sectors:
+        portfolio = 3
+    elif sector_count == 0:
+        portfolio = 5
+    elif sector_count == 1:
+        portfolio = 2
+    else:
+        portfolio = 0
+        flags.append(f"Recent purchases already concentrated in {sector}")
+    if months_since_last_buy is not None and months_since_last_buy < 3:
+        portfolio = min(portfolio, 1)
+        flags.append("Bought recently; avoid doubling up too soon")
+    bd['portfolio'] = portfolio
+
+    total = quality + valuation + entry + income + portfolio
+    if stock_data.get('is_high_debt'):
+        total -= 8
+        flags.append("High leverage reduces long-term margin of safety")
+    if stock_data.get('data_uncertain'):
+        total -= 40
+        flags.append("Price data uncertain")
+    if sector in {'materials', 'chemicals', 'energy'} and pe > thresh['ok'] and div_yield < 2:
+        total -= 4
+
+    total = max(0, min(MAX_LONG_TERM_SCORE, round(total)))
+    if total >= 80:
+        label = "🟢 HIGH-CONVICTION"
+    elif total >= 68:
+        label = "🟢 BUY CANDIDATE"
+    elif total >= 55:
+        label = "🟡 WATCHLIST"
+    else:
+        label = "🔴 NOT INVESTMENT-GRADE"
+    return total, bd, label, flags
+
+
 def effective_score(item):
     """Score adjusted for actionability (used for sort order, not display)."""
     s = item['score']
@@ -1100,6 +1512,45 @@ def effective_score(item):
     elif tv == "🟡 CAUTION":
         s -= 5
     return s
+
+
+def effective_long_term_score(item):
+    """Long-term score adjusted for actionability; this drives default ranking."""
+    s = item.get('long_term_score', item.get('score', 0))
+    is_golden = item['sma50'] > item['sma200']
+    tv = item['timing_verdict']
+    if item.get('data_uncertain'):
+        s -= 40
+    if not is_golden:
+        s -= 18
+    elif tv == "⏳ WAIT":
+        s -= 10
+    elif tv == "🟡 CAUTION":
+        s -= 4
+    if item.get('eh_label') == '🔴 DETERIORATING':
+        s -= 25
+    elif item.get('eh_label') == '🟠 WEAKENING':
+        s -= 8
+    return s
+
+
+def is_actionable(r):
+    """Whether a stock is a clean buy *right now*.
+
+    Single source of truth for the "should I actually pull the trigger" gate,
+    used by pick_actionable, budget_fit and the UI badge so they can never drift
+    apart. A stock is actionable only if it is in an uptrend, not flagged to
+    WAIT, not showing deteriorating earnings, not bought in the last 2 months,
+    and its price data looks trustworthy (see the stale-price guardrail).
+    """
+    return bool(
+        r.get('is_golden')
+        and r.get('timing_verdict') != "⏳ WAIT"
+        and r.get('eh_label', '') != '🔴 DETERIORATING'
+        and r.get('long_term_score', 100) >= 55
+        and (r.get('months_since_buy') is None or r['months_since_buy'] >= 2)
+        and not r.get('data_uncertain', False)
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1140,6 +1591,10 @@ def project_annual_dividend(open_units, div_yield_pct, current_price):
 def one_line_reason(item):
     """The single sentence that justifies the buy — what you read instead of thinking."""
     bits = []
+    if item.get('long_term_score', 0) >= 68:
+        bits.append(f"long-term score {item['long_term_score']}")
+    if item.get('roe', 0) >= 12:
+        bits.append(f"{item['roe']:.0f}% ROE")
     pullback = (item['week52_high'] - item['price']) / item['week52_high'] * 100 if item['week52_high'] > 0 else 0
     if pullback >= 10:
         bits.append(f"{pullback:.0f}% below its 52-week high")
@@ -1211,16 +1666,56 @@ def analyze_all(config=None, purchase_log=None, sell_log=None,
         debt_str, is_high_debt = debt_flag(sector, debt_to_equity)
         eh_warnings, eh_penalty, eh_label = get_earnings_health_signals(earnings_health, sector)
 
+        # The score is built on daily history from `df`, but order sizing should
+        # use the best live quote yfinance exposes. Bursa history can lag intra-
+        # day and sometimes leaves the open as the latest "Close"; do not size a
+        # broker order from that if `info.currentPrice` is available.
+        info_price = analyst_data.get('current_price', 0) or 0
+        df_price = stats['price']
+        data_uncertain = False
+        data_warning = None
+        order_price = df_price
+        price_source = 'history_close'
+        if info_price > 0 and df_price > 0:
+            divergence = abs(info_price - df_price) / df_price
+            if math.isfinite(info_price):
+                order_price = info_price
+                price_source = 'live_quote'
+            if divergence > 0.05:
+                data_uncertain = True
+                data_warning = (
+                    f"Live price {currency} {info_price:.3f} diverges {divergence * 100:.0f}% "
+                    f"from last close {currency} {df_price:.3f} — price data may be stale"
+                )
+            elif divergence > 0.01:
+                data_warning = (
+                    f"Order price uses live quote {currency} {info_price:.3f}; "
+                    f"history close is {currency} {df_price:.3f}"
+                )
+
+        # Prefer live quote-session OHLC for execution advice when available.
+        for stat_key, info_key in (
+            ('day_open', 'day_open'),
+            ('day_high', 'day_high'),
+            ('day_low', 'day_low'),
+            ('prev_close', 'previous_close'),
+        ):
+            live_val = analyst_data.get(info_key, 0) or 0
+            if math.isfinite(live_val) and live_val > 0:
+                stats[stat_key] = live_val
+
         stats.update({
             'ticker': ticker, 'sector': sector, 'name': name, 'currency': currency,
             'div_yield': div_yield, 'pe_ratio': pe_ratio, 'roe': roe, 'revenue': revenue,
             'profit_margin': profit_margin, 'div_years': div_years, 'div_growing': div_growing,
             'debt_to_equity': debt_to_equity, 'debt_str': debt_str, 'is_high_debt': is_high_debt,
-            'smart_lots': calculate_min_lots(stats['price'], ticker),
+            'order_price': order_price, 'price_source': price_source,
+            'smart_lots': calculate_min_lots(order_price, ticker),
             'timing_green': t_green, 'timing_yellow': t_yellow, 'timing_verdict': t_verdict,
             'months_since_buy': months_since,
             'eh_warnings': eh_warnings, 'eh_penalty': eh_penalty, 'eh_label': eh_label,
             'analyst_data': analyst_data, 'earnings_health': earnings_health,
+            'data_uncertain': data_uncertain, 'data_warning': data_warning,
         })
 
         score, breakdown = calculate_savings_score(stats, sector, recent_sectors, months_since)
@@ -1228,18 +1723,31 @@ def analyze_all(config=None, purchase_log=None, sell_log=None,
         stats['breakdown'] = breakdown
         stats['effective_score'] = effective_score(stats)
         stats['is_golden'] = stats['sma50'] > stats['sma200']
+        long_score, long_bd, long_label, long_flags = calculate_long_term_score(
+            stats, sector, recent_sectors, months_since
+        )
+        stats['long_term_score'] = long_score
+        stats['long_term_breakdown'] = long_bd
+        stats['long_term_label'] = long_label
+        stats['long_term_flags'] = long_flags
+        stats['effective_long_term_score'] = effective_long_term_score(stats)
         stats['pullback_pct'] = (
             (stats['week52_high'] - stats['price']) / stats['week52_high'] * 100
             if stats['week52_high'] > 0 else 0
         )
         stats['trend_label'] = trend_label(stats['sma50'], stats['sma200'], stats['price'])
         stats['reason'] = one_line_reason(stats)
+        stats['entry_plan'] = limit_order_plan(stats)
+        if stats['entry_plan']:
+            stats['suggested_limit_price'] = stats['entry_plan']['suggested_limit_price']
+            stats['patient_limit_price'] = stats['entry_plan']['patient_limit_price']
+            stats['max_entry_price'] = stats['entry_plan']['max_entry_price']
         results.append(stats)
 
         if polite_delay:
             time.sleep(polite_delay)
 
-    results.sort(key=lambda r: r['effective_score'], reverse=True)
+    results.sort(key=lambda r: r['effective_long_term_score'], reverse=True)
     if progress:
         progress(total, total, "Done")
 
@@ -1251,24 +1759,69 @@ def analyze_all(config=None, purchase_log=None, sell_log=None,
         'sector_counts': dict(Counter(r['sector'] for r in results)),
         'results': results,
         'max_score': MAX_SCORE,
+        'max_long_term_score': MAX_LONG_TERM_SCORE,
     }
 
 
 def pick_actionable(results):
-    """First fully-actionable stock: golden + not WAIT + not deteriorating + not bought <2mo."""
-    actionable = [
-        r for r in results
-        if r['is_golden']
-        and r['timing_verdict'] != "⏳ WAIT"
-        and r.get('eh_label', '') != '🔴 DETERIORATING'
-        and (r.get('months_since_buy') is None or r['months_since_buy'] >= 2)
-    ]
-    return actionable[0] if actionable else (results[0] if results else None)
+    """The best fully-actionable stock this month, or None if there isn't one.
+
+    Returns None when nothing clears the actionability bar (see is_actionable) —
+    "NO PURCHASE THIS MONTH" is a valid, first-class answer. We deliberately do
+    NOT fall back to the least-bad name: a screener forced to name a pick every
+    month hands you a loser dressed up as a green light. Carrying cash forward is
+    the whole point of a discipline tool.
+    """
+    actionable = [r for r in results if is_actionable(r)]
+    return actionable[0] if actionable else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUDGET FIT  — the headline feature: "spend RM X on the best buy"
 # ─────────────────────────────────────────────────────────────────────────────
+def _build_pick(r, lots, units, spend, fee, budget):
+    """Assemble the buy dict returned by budget_fit (shared by .KL and US/HK)."""
+    order_price = r.get('order_price', r['price'])
+    entry_plan = limit_order_plan(r)
+    suggested_limit = entry_plan.get('suggested_limit_price') if entry_plan else None
+    suggested_spend = (suggested_limit * units) if suggested_limit else None
+    suggested_fee = (
+        bursa_fees(suggested_spend)
+        if suggested_spend and r['ticker'].endswith('.KL')
+        else 0.0
+    )
+    return {
+        'ticker': r['ticker'], 'name': r['name'], 'sector': r['sector'],
+        'currency': r['currency'], 'price': round(order_price, 4),
+        'analysis_price': round(r['price'], 4),
+        'price_source': r.get('price_source', 'history_close'),
+        'lots': lots, 'units': units,
+        'estimated_cost': round(spend, 2), 'estimated_fee': round(fee, 2),
+        'fee_pct': round((fee / spend) * 100, 3) if spend else 0.0,
+        'total_outlay': round(spend + fee, 2),
+        'budget': budget, 'leftover': round(budget - spend - fee, 2),
+        'entry_plan': entry_plan,
+        'suggested_limit_price': round(suggested_limit, 4) if suggested_limit else None,
+        'patient_limit_price': entry_plan.get('patient_limit_price') if entry_plan else None,
+        'max_entry_price': entry_plan.get('max_entry_price') if entry_plan else None,
+        'suggested_cost': round(suggested_spend, 2) if suggested_spend else None,
+        'suggested_fee': round(suggested_fee, 2) if suggested_spend else None,
+        'suggested_total_outlay': round(suggested_spend + suggested_fee, 2) if suggested_spend else None,
+        'suggested_leftover': round(budget - suggested_spend - suggested_fee, 2) if suggested_spend else None,
+        'score': r['score'], 'effective_score': r['effective_score'],
+        'long_term_score': r.get('long_term_score'),
+        'effective_long_term_score': r.get('effective_long_term_score'),
+        'long_term_label': r.get('long_term_label'),
+        'long_term_breakdown': r.get('long_term_breakdown', {}),
+        'long_term_flags': r.get('long_term_flags', []),
+        'timing_verdict': r['timing_verdict'], 'eh_label': r.get('eh_label', ''),
+        'div_yield': r['div_yield'], 'pullback_pct': round(r['pullback_pct'], 1),
+        'reason': r['reason'], 'is_actionable': is_actionable(r),
+        'data_uncertain': r.get('data_uncertain', False),
+        'data_warning': r.get('data_warning'),
+    }
+
+
 def budget_fit(results, budget, only_actionable=True, prefer=None):
     """Given a monthly budget, return the best stock and exact lots that fit.
 
@@ -1277,33 +1830,47 @@ def budget_fit(results, budget, only_actionable=True, prefer=None):
       keeping fee% under control (fees are tiny above ~1 lot anyway).
     - For US/HK: buys as many whole shares as fit.
     - `prefer`: optional ticker to force (e.g. user clicked a specific row).
-    Returns a dict describing the buy, or None if nothing fits.
+
+    Returns either a buy dict, or a {'no_purchase': True, 'reason': ...} dict when
+    the honest answer is "buy nothing this month" — distinguishing a *quality*
+    veto (nothing clears the bar) from an *affordability* miss (qualifying names
+    exist but none fit the budget). Returns None only when there's nothing to
+    evaluate at all. Budget never influences ranking — it only sizes the position
+    of the already-ranked pick.
     """
     if not results or not budget or budget <= 0:
         return None
 
-    candidates = results
     if prefer:
         candidates = [r for r in results if r['ticker'] == prefer] or results
     elif only_actionable:
-        actionable = [
-            r for r in results
-            if r['is_golden']
-            and r['timing_verdict'] != "⏳ WAIT"
-            and r.get('eh_label', '') != '🔴 DETERIORATING'
-            and (r.get('months_since_buy') is None or r['months_since_buy'] >= 2)
-        ]
-        candidates = actionable or results
+        candidates = [r for r in results if is_actionable(r)]
+        if not candidates:
+            # Quality veto — not an affordability problem. Honour NO PURCHASE.
+            return {
+                'no_purchase': True, 'kind': 'quality', 'budget': budget,
+                'reason': (
+                    "No stock clears the actionability bar this month — every name is in a "
+                    "death cross, flagged WAIT, showing deteriorating earnings, was bought "
+                    "in the last 2 months, or has uncertain price data. Carry this month's "
+                    "cash forward rather than forcing a least-bad buy."
+                ),
+            }
+    else:
+        candidates = results
 
     for r in candidates:
         ticker = r['ticker']
-        price = r['price']
-        currency = r['currency']
+        price = r.get('order_price', r['price'])
+        if not math.isfinite(price) or price <= 0:
+            continue
         unit = units_per_lot(ticker)
 
         if ticker.endswith('.KL'):
             # How many 100-unit lots fit the budget (leave room for fees)?
             cost_per_lot = price * unit
+            if not math.isfinite(cost_per_lot) or cost_per_lot <= 0:
+                continue
             max_lots = int(budget // cost_per_lot)
             if max_lots < 1:
                 continue  # even one lot too expensive — try next candidate
@@ -1314,43 +1881,37 @@ def budget_fit(results, budget, only_actionable=True, prefer=None):
                 max_lots -= 1
                 spend = cost_per_lot * max_lots
                 fee = bursa_fees(spend)
-            fee_pct = (fee / spend) * 100 if spend else 0
-            return {
-                'ticker': ticker, 'name': r['name'], 'sector': r['sector'],
-                'currency': currency, 'price': round(price, 4),
-                'lots': max_lots, 'units': max_lots * unit,
-                'estimated_cost': round(spend, 2), 'estimated_fee': round(fee, 2),
-                'fee_pct': round(fee_pct, 3), 'total_outlay': round(spend + fee, 2),
-                'budget': budget, 'leftover': round(budget - spend - fee, 2),
-                'score': r['score'], 'effective_score': r['effective_score'],
-                'timing_verdict': r['timing_verdict'], 'eh_label': r.get('eh_label', ''),
-                'div_yield': r['div_yield'], 'pullback_pct': round(r['pullback_pct'], 1),
-                'reason': r['reason'], 'is_actionable': bool(
-                    r['is_golden'] and r['timing_verdict'] != "⏳ WAIT"
-                    and r.get('eh_label', '') != '🔴 DETERIORATING'
-                ),
-            }
+            return _build_pick(r, max_lots, max_lots * unit, spend, fee, budget)
         else:
             max_shares = int(budget // price)
             if max_shares < 1:
                 continue
             spend = price * max_shares
-            return {
-                'ticker': ticker, 'name': r['name'], 'sector': r['sector'],
-                'currency': currency, 'price': round(price, 4),
-                'lots': max_shares, 'units': max_shares,
-                'estimated_cost': round(spend, 2), 'estimated_fee': 0.0,
-                'fee_pct': 0.0, 'total_outlay': round(spend, 2),
-                'budget': budget, 'leftover': round(budget - spend, 2),
-                'score': r['score'], 'effective_score': r['effective_score'],
-                'timing_verdict': r['timing_verdict'], 'eh_label': r.get('eh_label', ''),
-                'div_yield': r['div_yield'], 'pullback_pct': round(r['pullback_pct'], 1),
-                'reason': r['reason'], 'is_actionable': bool(
-                    r['is_golden'] and r['timing_verdict'] != "⏳ WAIT"
-                    and r.get('eh_label', '') != '🔴 DETERIORATING'
-                ),
-            }
-    return None
+            return _build_pick(r, max_shares, max_shares, spend, 0.0, budget)
+
+    # Qualifying candidates existed, but none fit the budget → affordability miss.
+    priced_candidates = [
+        r for r in candidates
+        if math.isfinite(r.get('order_price', r.get('price', 0))) and r.get('order_price', r.get('price', 0)) > 0
+    ]
+    if not priced_candidates:
+        return {
+            'no_purchase': True, 'kind': 'data', 'budget': budget,
+            'reason': "No qualifying pick has a valid price right now. Refresh data and verify quotes manually.",
+        }
+    cheapest = min(priced_candidates, key=lambda r: r.get('order_price', r['price']) * units_per_lot(r['ticker']))
+    unit_word = 'lot' if cheapest['ticker'].endswith('.KL') else 'share'
+    min_cost = cheapest.get('order_price', cheapest['price']) * units_per_lot(cheapest['ticker'])
+    return {
+        'no_purchase': True, 'kind': 'budget', 'budget': budget,
+        'cheapest': {'ticker': cheapest['ticker'], 'min_cost': round(min_cost, 2),
+                     'currency': cheapest['currency']},
+        'reason': (
+            f"The cheapest qualifying pick, {cheapest['ticker']}, needs about "
+            f"{cheapest['currency']} {min_cost:,.2f} for one {unit_word} — "
+            f"{min_cost / budget:.1f}× your budget. Increase the budget or wait."
+        ),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

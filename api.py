@@ -195,8 +195,11 @@ def budget(req: BudgetRequest):
         only_actionable=req.only_actionable, prefer=req.prefer,
     )
     if not pick:
-        return {"pick": None, "message": "Nothing in the watchlist fits this budget."}
-    return {"pick": pick}
+        return {"pick": None, "message": "No stocks were analysed yet — run /api/analyze first."}
+    # `budget_fit` may return a first-class "buy nothing this month" signal; pass
+    # it straight through (its `reason` explains whether it's a quality veto or an
+    # affordability miss). The frontend renders it as a distinct card.
+    return {"pick": pick, "message": pick.get("reason") if pick.get("no_purchase") else None}
 
 
 @app.get("/api/holdings")

@@ -150,7 +150,7 @@ export default function App() {
               onChange={(e) => setOnlyActionable(e.target.checked)}
               className="h-4 w-4 accent-[#34d399]"
             />
-            Only actionable (golden cross, not WAIT, healthy)
+            Only actionable (investment-grade, golden cross, not WAIT, healthy)
           </label>
           <div className="flex gap-2">
             <Button onClick={() => runAnalysis(true)} disabled={running}>
@@ -211,7 +211,12 @@ export default function App() {
               onLog={(p) =>
                 setLogModal({
                   kind: "buy",
-                  prefill: { ticker: p.ticker, price: p.price, lots: p.lots, currency: p.currency },
+                  prefill: {
+                    ticker: p.ticker,
+                    price: p.suggested_limit_price ?? p.price,
+                    lots: p.lots,
+                    currency: p.currency,
+                  },
                 })
               }
             />
@@ -225,7 +230,13 @@ export default function App() {
             <Card className="p-8 text-center text-muted">Run an analysis to populate the watchlist.</Card>
           ) : (
             analysis.results.map((item, i) => (
-              <StockRow key={item.ticker} item={item} rank={i} maxScore={analysis.max_score} onPick={(t) => refreshBudget(t)} />
+              <StockRow
+                key={item.ticker}
+                item={item}
+                rank={i}
+                maxScore={analysis.max_long_term_score || 100}
+                onPick={(t) => refreshBudget(t)}
+              />
             ))
           )}
         </div>

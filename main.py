@@ -70,9 +70,12 @@ def main():
         sma200 = item['sma200']
         curr = item['currency']
         score = item['score']
+        long_score = item.get('long_term_score', score)
         bd = item['breakdown']
+        ltd = item.get('long_term_breakdown', {})
         pullback = item['pullback_pct']
         eff_s = item['effective_score']
+        eff_lt = item.get('effective_long_term_score', long_score)
         is_golden = item['is_golden']
         tv = item['timing_verdict']
 
@@ -80,12 +83,12 @@ def main():
             print("─" * W)
             actionable = is_golden and tv != "⏳ WAIT"
             tag = "" if actionable else "  ⚠️  NOT ACTIONABLE THIS MONTH"
-            print(f"  {medals[rank]}  (Score: {score}  |  Effective: {eff_s}){tag}")
+            print(f"  {medals[rank]}  (Long-term: {long_score}  |  Effective LT: {eff_lt}  |  Setup: {score}){tag}")
         elif rank == 3:
             print("─" * W)
             print("  📋  FULL WATCHLIST")
 
-        bar_fill = max(0, min(20, round(score / 6)))
+        bar_fill = max(0, min(20, round(long_score / 5)))
         bar = "█" * bar_fill + "░" * (20 - bar_fill)
 
         if   item['div_years'] >= 5: div_str = f"✅ {item['div_years']} yrs"
@@ -102,8 +105,35 @@ def main():
             months_tag = "  |  Never bought"
 
         print(f"\n  {item['name']} ({item['ticker']})  [{item['sector'].upper()}]{months_tag}")
-        print(f"  [{bar}] Score: {score}  (effective {eff_s})")
-        print(f"  Price:    {curr} {price:.3f}  |  52w High: {curr} {item['week52_high']:.3f}  |  Pullback: {pullback:.1f}%")
+        print(f"  [{bar}] Long-term score: {long_score}  (effective {eff_lt})  |  Legacy setup: {score} (effective {eff_s})")
+        if item.get('long_term_label'):
+            print(f"  Conviction: {item['long_term_label']}")
+        if ltd:
+            print("  Long-term: "
+                  f"Quality={ltd.get('quality',0)} | Valuation={ltd.get('valuation',0)} | "
+                  f"Entry={ltd.get('entry',0)} | Income={ltd.get('income',0)} | "
+                  f"Portfolio={ltd.get('portfolio',0)}")
+        for flag in item.get('long_term_flags', []):
+            print(f"  ⚠️  {flag}")
+        if item.get('data_uncertain'):
+            print(f"  ⚠️  DATA UNCERTAIN: {item.get('data_warning', 'price data may be stale')}")
+            print("       → excluded from the auto-pick until the two price feeds agree")
+        quote_price = item.get('order_price', price)
+        if abs(quote_price - price) > 0.001:
+            print(
+                f"  Quote:    {curr} {quote_price:.3f}  |  Analysis close: {curr} {price:.3f}  |  "
+                f"52w High: {curr} {item['week52_high']:.3f}  |  Pullback: {pullback:.1f}%"
+            )
+        else:
+            print(f"  Quote:    {curr} {quote_price:.3f}  |  52w High: {curr} {item['week52_high']:.3f}  |  Pullback: {pullback:.1f}%")
+        entry_plan = engine.limit_order_plan(item)
+        if entry_plan:
+            print(
+                f"  Entry:    Limit {curr} {entry_plan['suggested_limit_price']:.3f}  |  "
+                f"Patient {curr} {entry_plan['patient_limit_price']:.3f}  |  "
+                f"Max chase {curr} {entry_plan['max_entry_price']:.3f}"
+            )
+            print(f"            {entry_plan['reason']}")
         print(f"  Yield:    {item['div_yield']:.2f}%  |  RSI: {item['rsi']:.1f} (info only)  |  Vol: {'🔥 HIGH' if item['volume_strong'] else 'Normal'}")
         print(f"  PE:       {item['pe_ratio']:.2f}{pe_flag(item['pe_ratio'])}  |  ROE: {roe_display}  |  Margin: {item['profit_margin']:.2f}%")
         print(f"  Revenue:  {item['revenue']} (TTM)  |  Sector PE bands: "
@@ -300,17 +330,27 @@ def main():
     top = pick_actionable(results)
     if top:
         lots = top['smart_lots']
+        order_price = top.get('order_price', top['price'])
+        entry_plan = engine.limit_order_plan(top)
+        target_price = entry_plan['suggested_limit_price'] if entry_plan else order_price
         log_entry = {
             "month": datetime.now().strftime("%Y-%m"),
             "ticker": top['ticker'],
-            "price": round(top['price'], 3),
+            "price": round(target_price, 3),
             "currency": top['currency'],
             "lots": lots['lots'] if lots else 1,
         }
         print(f"   {json.dumps(log_entry)}")
+        if entry_plan:
+            print(
+                f"   (Suggested limit: {top['currency']} {target_price:.3f}; "
+                f"only log once your broker order actually fills.)"
+            )
         if top != results[0]:
-            print(f"   (Note: {results[0]['ticker']} ranks highest on score but skipped — "
+            print(f"   (Note: {results[0]['ticker']} ranks highest on long-term score but skipped — "
                   f"earnings health: {results[0].get('eh_label','?')})")
+    else:
+        print("   (Nothing actionable to log this month — carry your cash forward.)")
 
     print("\n" + "=" * W)
     print("🎯  THIS MONTH'S BEST BUY — FINAL VERDICT")
@@ -318,21 +358,42 @@ def main():
     if top:
         curr = top['currency']
         lots = top['smart_lots']
+        order_price = top.get('order_price', top['price'])
+        entry_plan = engine.limit_order_plan(top)
+        target_price = entry_plan['suggested_limit_price'] if entry_plan else order_price
         tv = top['timing_verdict']
         print(f"\n  ✅ {top['name']} ({top['ticker']})  [{top['sector'].upper()}]")
-        print(f"     Score {top['score']}  |  Effective {top['effective_score']}  |  Earnings: {top.get('eh_label','🟢 STABLE')}")
-        print(f"     Price {curr} {top['price']:.3f}  |  Yield {top['div_yield']:.2f}%  |  PE {top['pe_ratio']:.2f}")
+        print(
+            f"     Long-term {top.get('long_term_score', top['score'])} "
+            f"| Effective LT {top.get('effective_long_term_score', top.get('long_term_score', top['score']))} "
+            f"| Legacy setup {top['score']}  |  Earnings: {top.get('eh_label','🟢 STABLE')}"
+        )
+        print(f"     Order price {curr} {order_price:.3f}  |  Yield {top['div_yield']:.2f}%  |  PE {top['pe_ratio']:.2f}")
+        if entry_plan:
+            print(
+                f"     Suggested limit {curr} {target_price:.3f}  |  "
+                f"Patient {curr} {entry_plan['patient_limit_price']:.3f}  |  "
+                f"Don't chase above {curr} {entry_plan['max_entry_price']:.3f}"
+            )
+            print(f"     Entry note: {entry_plan['reason']}")
+        if abs(order_price - top['price']) > 0.001:
+            print(f"     Analysis close {curr} {top['price']:.3f}  |  Source: {top.get('price_source', 'history_close')}")
         print(f"     Timing: {tv}")
         print(f"     Why: {top['reason']}")
         if lots:
             if tv == "🟡 CAUTION":
                 half = max(1, lots['lots'] // 2)
-                half_cost = half * 100 * top['price']
+                half_cost = half * 100 * target_price
                 print(f"\n  👉 BUY {half} lot(s) now → {curr} {half_cost:.2f}  (half position, caution flag active)")
             else:
-                print(f"\n  👉 BUY {lots['lots']} lot(s) → {curr} {lots['cost']:.2f}  (fee: {lots['fee_pct']:.2f}%)")
+                target_cost = lots['lots'] * 100 * target_price
+                target_fee = engine.bursa_fees(target_cost) if top['ticker'].endswith('.KL') else 0.0
+                print(
+                    f"\n  👉 PLACE LIMIT BUY {lots['lots']} lot(s) @ {curr} {target_price:.3f} "
+                    f"→ est. {curr} {target_cost + target_fee:.2f} incl. fee"
+                )
         else:
-            print(f"\n  👉 BUY 1 unit → {curr} {top['price']:.3f}")
+            print(f"\n  👉 BUY 1 unit → {curr} {target_price:.3f}")
         eh_yellow = [w for w in top.get('eh_warnings', []) if w.startswith('🟡') or w.startswith('🟠')]
         if eh_yellow:
             print("\n  ⚠️  Watch points:")

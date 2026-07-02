@@ -1,5 +1,5 @@
 {
-  "period": "2y",
+  "period": "3y",
   "tickers": [
     {
       "ticker": "1155.KL",
@@ -47,7 +47,7 @@
     },
     {
       "ticker": "1818.KL",
-      "sector": "reit"
+      "sector": "exchange"
     },
     {
       "ticker": "5347.KL",
@@ -115,11 +115,11 @@
     },
     {
       "ticker": "4197.KL",
-      "sector": "general"
+      "sector": "industrial"
     },
     {
       "ticker": "5288.KL",
-      "sector": "general"
+      "sector": "property"
     },
     {
       "ticker": "5225.KL",
@@ -127,7 +127,7 @@
     },
     {
       "ticker": "8869.KL",
-      "sector": "general"
+      "sector": "materials"
     },
     {
       "ticker": "5168.KL",
@@ -135,7 +135,7 @@
     },
     {
       "ticker": "5183.KL",
-      "sector": "general"
+      "sector": "chemicals"
     },
     {
       "ticker": "5185.KL",
